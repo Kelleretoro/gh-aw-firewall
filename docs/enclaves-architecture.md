@@ -85,6 +85,14 @@ what evidence supports it. Existing Docker capabilities must survive extraction.
 
 ### Roles and execution combinations
 
+The pinned Copilot distribution and native addons are extracted during image
+build, root-owned and non-writable under
+`/usr/local/lib/node_modules/@github/copilot/runtime`. The pinned SEA loader's
+`COPILOT_CLI_DIST_DIR` selects this immutable distribution in both Docker and
+Cloud Hypervisor images, independently of invocation `HOME=/agent/home`.
+Docker's writable `/agent` backing storage and `/tmp` remain `noexec`; native
+addons must not be extracted there.
+
 | Role | Observable contract | Security boundary |
 | --- | --- | --- |
 | Primary agent | Runs the caller's command with the approved workspace, environment, proxy routes and workdir; streams command output and returns its exit status. | Primary workspace is not a private repository seed. No enclave-private roots, enclave credentials, broker capability, ledger, or recovery journal. |
@@ -113,9 +121,13 @@ and release conformance exception have different predicates; neither grants
 private-repository acceptance. `assertCloudHypervisorWorkloadLaunchable` also
 requires trusted enclave-executor authorization. Its boolean is not a user flag.
 
-Exactly **one workload backend per run** covers the primary and every enabled
-executor. Omitted runtimes inherit the primary; Docker/runc and gVisor/runsc are
-aliases within their respective backends, not equivalent to each other.
+By default, **one workload backend per run** covers the primary and every enabled
+executor. The explicit exception is a Docker primary with a static Cloud
+Hypervisor agent enclave, optionally accompanied by a Cloud Hypervisor script
+enclave. Omitted runtimes still inherit the primary; all enabled enclave
+executors in that exception must explicitly select Cloud Hypervisor.
+Docker/runc and gVisor/runsc are aliases within their respective backends,
+not equivalent to each other.
 Supporting Docker proxy/broker infrastructure does not make a VM workload a
 Docker workload. Unknown selections, backend mismatches, missing prerequisites and
 launch failures must fail closed, except for the existing Cloud Hypervisor
@@ -132,9 +144,9 @@ containers, user-space kernels and hardware VMs equivalent isolation boundaries.
 | --- | --- | --- | --- |
 | Static repository seeds | I: script and agent; merged trusted catalog | U: no enclave runtime | G: host executor implemented; public acceptance scope above, private acceptance V |
 | Dynamic repositories | G: agent only, compiler delegation handoff and supported mcpg required | U | U: preflight rejects |
-| Static GitHub tools | G: compiler-scoped identity, `list_issues` / `issue_read`; legacy `issues-read-v1` retained | U for enclaves | U: scoped executor bearer handoff missing on accepted host path |
+| Static GitHub tools | G: compiler-scoped identity, `list_issues` / `issue_read`; legacy `issues-read-v1` retained | U for enclaves | G: requires the scoped executor capability contract below; older compilers fail closed |
 | Dynamic GitHub tools | G: `github-repository-read-v1`, one repository per invocation | U | U |
-| Enclave engines | I: Copilot only; other engine names are parsed but rejected | U | G: Copilot in acceptance fixtures; other engines rejected despite wider profile types |
+| Enclave engines | I: Copilot, Codex (OpenAI profile), Claude (Anthropic profile); Gemini rejected | U | G: the same three native engines in the shared AWF-attested enclave rootfs; public daily regression fixtures |
 | Primary engines/commands | I: arbitrary installed command, provider routes as configured | G: guest-installed commands, approved environment/routes | G: guest-installed commands, approved environment/routes |
 | Trusted custom enclave images | I: script/agent image override retained; does not implement another engine | U | U: requires AWF-attested enclave artifacts |
 | Primary images/tool availability | I: existing local-build, registry/tag and agent-image options | G: explicit distro layer; not OCI image parity | G: attested rootfs/supervisor; not OCI image parity |
@@ -165,7 +177,7 @@ disposable fixtures and the final workload identity, not privileged `docker exec
 | Primary environment and proxies | `src/services/agent-environment-{credentials,proxy}.test.ts`, `src/microvm/guest-environment.test.ts`, `src/cloud-hypervisor-runtime-backend.env-mapping.test.ts`, `src/nvx/guest-entrypoint.test.ts` | Verify explicit env/env-file/env-all precedence, reserved guest HOME/PATH/proxy handling, allowed/denied egress and absent provider secrets with API proxy enabled. VM tool caches are read-only seeds, not live Docker home shares. |
 | Primary status, output, cancellation | `src/run-agent-command.test.ts`, `src/commands/signal-handler.test.ts`, `src/{cloud-hypervisor-runtime-backend,nvx/runtime-backend}.test.ts` | Command exits 0/nonzero, streams stdout/stderr, then interrupt an active command and verify guest/process/resource teardown. NVX is one-shot; Cloud Hypervisor uses supervisor requests; do not invent common TTY or signal-number semantics. |
 | Script no-network | `src/enclave/script-runner-spec.test.ts`, `src/cloud-hypervisor/enclave-network.test.ts`, `src/cloud-hypervisor/workload-profile.test.ts` | Deny IPv4/IPv6, DNS, direct IP, proxy and host-service connections. Docker uses `--network none`; Cloud Hypervisor omits NIC and creates only an empty network namespace. NVX enclave checks unavailable. |
-| Agent dedicated proxy and authorized GitHub only | `src/enclave/{agent-runner-spec,github-gateway,preflight}.test.ts`, `src/cloud-hypervisor/enclave-network.test.ts` | Assert exact peer set, deny primary/Squid/internet and unauthorized repo/tool calls; no provider key in workload. VM static GitHub admission remains U even if network profiles validate. |
+| Agent dedicated proxy and authorized GitHub only | `src/enclave/{agent-runner-spec,github-gateway,static-github-handoff,preflight}.test.ts`, `src/cloud-hypervisor/enclave-network.test.ts` | Assert exact peer set, deny primary/Squid/internet and unauthorized repo/tool calls; no provider key in workload. Live VM scoped GitHub acceptance requires a compiler/gateway implementing the capability contract below. |
 | Immutable seed, private invocation state, non-root identity | `src/enclave/{staging,invocation-staging,mount-policy}.test.ts`, `src/cloud-hypervisor/{enclave-export-plan,workload-profile}.test.ts` | Attempt seed/root writes and cross-invocation reads; inspect UID/GID, groups, capabilities and denied host paths. VM profile fixes enclave UID/GID 65534; do not infer live DAC from export metadata. See filesystem contract for remaining identity gaps. |
 | Aggregate storage and resource limits | `src/enclave/execution-policy.test.ts`, runner-spec tests, `src/cloud-hypervisor/{enclave-storage,trusted-enclave-storage}.test.ts` | Multi-file/concurrent/sparse writers across every writable export; memory/process/CPU exhaustion. Privileged storage integration tests are separate from mocked policy evidence. Docker host-output confinement has real-daemon fixture evidence; live Copilot combinations remain V. See the Docker acceptance scope below. |
 | Canonical bounded results | `src/enclave/invocation-result.test.ts`, `src/bounded-execution/finite-disclosure-*.test.ts`, `src/enclave/host-executor-protocol.test.ts` | Malformed/oversized/non-UTF-8/wrong-schema output, symlink/special-file outputs, private stdout/stderr: only canonical approved result or non-disclosing error may reach primary. |
@@ -265,7 +277,7 @@ while leaving these restrictions fail closed.
 AWF stages immutable repository seeds on the host, starts one AWF-owned `enclave-mcp-server`, and exposes enabled executors only through `gh-aw-mcpg`.
 
 - **Script executor** — `enclave_run_script` runs a bounded Python script in a no-network, read-only, single-use sandbox.
-- **Agent executor** — `enclave_run_agent` runs the pinned Copilot engine in a bounded single-use enclave. Its mandatory peer is the dedicated API proxy; `agent.tools.github` (or the deprecated legacy `agent.github.cli: issues-read-v1` marker) also permits a direct connection to compiler-owned shared mcpg.
+- **Agent executor** — `enclave_run_agent` runs pinned Copilot, Codex, or Claude in a bounded single-use enclave. Codex requires the `openai` profile and Claude requires `anthropic`. Its mandatory peer is the dedicated API proxy; only the selected provider route is configured and real credentials remain outside the enclave. Copilot's `agent.tools.github` (or the deprecated legacy `agent.github.cli: issues-read-v1` marker) also permits a direct connection to compiler-owned shared mcpg. GitHub MCP and dynamic repository admission remain Copilot-only and fail closed for the other engines.
 - **Shared controls** — the `repos` lists of the `enclaves` entries form the only trusted repository catalog; script and agent calls debit the same per-run repository ledger and share one admission lane.
 
 > **Terminology.** *Executor* and *enclave* are distinct, and this document uses
@@ -344,9 +356,9 @@ this by construction:
 - Raw (but still secret-redacted via `redact_diagnostics`) text is restored
   only when the broker sets the privileged, non-caller-controlled
   `AWF_ENCLAVE_AGENT_DEBUG_RAW_SESSION_LOGS=true` environment variable on the
-  enclave container. AWF does not set this variable anywhere by default, so
-  raw enclave engine output never leaves the enclave unless an operator
-  deliberately wires up that opt-in for local debugging. The broker marks
+  enclave container. Eligible, positively verified public-only host execution
+  uses this trusted setting for protected retention; private, mixed, dynamic,
+  custom-image and unsupported-runtime scopes cannot enable it. The broker marks
   these transcripts and segregates them under its private
   `raw-debug-sessions/` directory instead of `sessions/`; the CLI's audit
   collector copies only `sessions/`, so raw-debug transcripts are never
@@ -355,8 +367,8 @@ this by construction:
   timeouts, cancellations, engine failures, malformed output, and
   configuration errors all route through `append_engine_result`,
   `read_copilot_diagnostics`, or the fixed `failure`/`operation-error`
-  shapes above, so there is no code path that appends raw enclave text to
-  the transcript.
+  shapes above. Outside authorized public-only debugging, there is no code path
+  that appends raw enclave text to the transcript.
 
 The only free-form, repository-derived value that is allowed to leave the
 enclave through a different channel is the broker-validated bounded result
@@ -367,6 +379,43 @@ through the audit transcript.
 See `src/enclave/agent-entrypoint-diagnostics.test.ts` and
 `src/enclave/agent-session-artifact.test.ts` for coverage of the
 default-redacted, privileged-opt-in, and artifact segregation behaviors.
+
+### Protected public-only diagnostics
+
+Top-level `enclaveDebugPublic` is runtime-neutral; the legacy
+`cloudHypervisor.enclaveDebugPublic` is Cloud Hypervisor-only, and the top-level
+value takes precedence. Retention defaults on only for static public-only
+built-in-image default Docker or attested Cloud Hypervisor executors, after
+credential-free GitHub metadata positively proves every repository public.
+An unavailable or unverified response disables capture for the run, not enclave
+execution. Explicit requests cannot authorize private/mixed/dynamic, custom-image,
+runsc, development or heterogeneous scopes. Workload payloads cannot opt in.
+
+Both runtimes retain a bounded, host-only artifact envelope after verified
+workload stop and before destroying invocation storage, including success,
+execution failure and partial setup failure. Retention is not a result channel:
+the primary receives only the existing canonical bounded result or non-disclosing
+failure. Missing streams and unavailable/backend-specific evidence are explicit,
+not inferred success. Protected-write failures prevent successful release and
+preserve source storage for recovery; abrupt host termination cannot guarantee
+capture.
+
+Docker acceptance in `tests/integration/enclave-docker-host.test.ts` uses audited
+entrypoints, real daemon operations, an unprivileged AWF process and the narrow
+version-matched storage helper. Only Copilot is synthetic; no production provider
+credential or live model is used. Fixture subprocesses use an explicit
+non-provider environment allowlist and empty isolated HOME/Docker configuration,
+and Docker receives an isolated build
+context containing only audited entrypoints and executor/server code, not the
+host workspace or credential files. Its trusted low-level image seam tests artifact
+handling, **not** permission for production custom-image retention. See
+[operator paths, bounds and controlled sharing](cloud-hypervisor-foundation.md#public-fixture-enclave-debugging).
+The controlled fixture covers success, nonzero workload exit, missing-network
+and genuine missing-image setup failures, unchanged large-file budgets, bounded
+retention, redaction, cleanup, and direct/symlink mount exclusion. A definitive
+missing-image response still requires independent named-container and invocation
+label absence; ambiguous create/transport failures retain their fail-closed
+pending intent instead of claiming cleanup.
 
 The AWF-owned MCP server publishes only the enabled enclave tools:
 
@@ -768,7 +817,7 @@ it directly as the `Authorization` value to
 endpoint before primary-agent work begins and requires the advertised tool set
 to be exactly the configured `allowed` list — no more, no fewer.
 
-The mcpg identity is job-lifetime, not per-invocation. Consequently, mcpg
+For Docker enclaves, the mcpg identity is job-lifetime, not per-invocation. Consequently, mcpg
 enforces the union of repositories configured for the enclave agent rather than
 binding the credential to one invocation's assigned repository, and the
 identity is not independently expired or revoked after each invocation. This
@@ -776,6 +825,113 @@ weaker lifetime and repository scope is an explicit tradeoff of direct shared
 mcpg access; AWF still isolates each identity file and enclave process and
 retains its own per-invocation seed, admission, ledger, output-schema, and
 timing controls.
+
+### Cloud Hypervisor scoped executor capability
+
+Static Cloud Hypervisor agent enclaves use a separate **executor bearer**, not
+Docker's identity-only authentication. A Docker primary with a static VM agent
+enclave is supported by AWF's topology validation; enabled enclave executors
+must all use Cloud Hypervisor. This does not open the general Cloud Hypervisor
+primary-with-enclaves topology, which retains its existing acceptance gates.
+Dynamic VM enclaves, custom images, split-filesystem DinD and runtime fallback
+remain unsupported.
+
+This is a coordinated compiler/gateway contract. **gh-aw v1.0.1 does not emit
+it and remains unsupported.** The compiler must remove its static VM GitHub
+rejection only when paired with AWF implementing this contract and a gateway
+that enforces the bearer policy. This repository does not change the compiler.
+Do not manually substitute `MCP_GATEWAY_API_KEY`, an existing static identity,
+a repository PAT or a staging token.
+
+Alongside the existing gateway handoff and
+`AWF_ENCLAVE_GITHUB_MCP_AGENT_ID`, the trusted compiler supplies
+`AWF_ENCLAVE_GITHUB_EXECUTOR_CAPABILITY` to the AWF host process as bounded JSON:
+
+```json
+{
+  "version": 1,
+  "gatewayIdentity": "compiler-run-identifier",
+  "executor": "agent",
+  "agentId": "<same compiler-issued enclave identity>",
+  "bearer": "<distinct gateway-issued executor capability>",
+  "issuedAt": 1800000000000,
+  "expiresAt": 1800003600000,
+  "allowedTools": ["issue_read", "list_issues"],
+  "allowedRepos": ["owner/private-repository"],
+  "minIntegrity": "approved"
+}
+```
+
+Times are Unix milliseconds. The closed record must match the gateway run
+label, agent identity, exact configured tool set, lowercase repository
+allowlist and integrity policy. `minIntegrity` is `null` when the trusted
+configuration supplies no override; the legacy marker selects both tools and
+the trusted catalog. No extra fields, duplicate grants, future issue time or
+lifetime over one hour is accepted. The capability must remain valid through
+the entire invocation timeout plus transport grace, including VM startup.
+
+The compiler/gateway is responsible for issuing an unforgeable capability
+bound to that run and executor, enforcing tools, repository allowlist,
+integrity and expiration on **every request**, and refusing other identities,
+servers and control operations. The JSON record is a trusted host handoff,
+not a self-authenticating token or a replacement for gateway authorization.
+The host verifies exact tool exposure using the scoped bearer before primary
+startup; it must not authenticate readiness with a broader key.
+
+AWF consumes and deletes the handoff environment variable before launching
+children, keeps the record in host-only memory, and excludes it from primary
+`--env-all` passthrough. The compiler must not leave the record in primary-visible
+workflow files, environment files, logs or workspace storage. Only the designated
+invocation's mode-0400, read-only session handoff receives the executor bearer.
+The guest's MCP configuration uses bearer-only authentication and the exact
+tool allowlist at `http://172.31.0.40:8080/mcp/github`.
+Both readiness and guest requests send the opaque `bearer` value unchanged as
+the `Authorization` header, without adding an authentication scheme prefix.
+The guest receives neither repository/staging credentials, the gateway-wide
+key, control credentials nor another executor's identity.
+
+The existing isolated bridge and per-peer/port VM firewall are unchanged: only
+the selected dedicated API-proxy port and the fixed GitHub data-plane endpoint
+are reachable. No direct GitHub, DNS, host-service or general internet route is
+added. Admission limits, information ledger, finite-schema output and cardinality
+bounds, artifact attestations and cleanup-before-release remain unchanged.
+
+The bearer has **run/executor scope**, not per-invocation repository scope.
+It is not individually revoked between invocations; each invocation's VM,
+network and private handoff storage must be destroyed before output release.
+AWF discards host custody after successful lifecycle drain. The compiler must
+stop the run-owned gateway and invalidate its capabilities on job completion
+or cancellation; expiration provides the maximum one-hour backstop after a
+crash. There is no renewal: later invocations fail closed once the remaining
+lifetime cannot cover their full deadline. Uncertain VM/storage cleanup retains
+protected recovery state and never releases a successful result.
+
+Runner prerequisites remain GitHub-hosted Ubuntu x86_64, privileged KVM,
+writable cgroup v2, the trusted aggregate-storage provider, a local Unix Docker
+daemon and matching release-attested common/enclave artifacts with explicit
+Cloud Hypervisor preview opt-in. Deterministic contract and guest tests are not
+evidence of a live compiler-to-VM GitHub run; that acceptance requires matching
+compiler/gateway releases and controlled issue fixtures.
+
+The existing live acceptance harness,
+`scripts/ci/cloud-hypervisor-enclave-live-smoke.js`, has an opt-in
+`AWF_ENCLAVE_LIVE_SCOPED_GITHUB=1` mode. It uses a Docker primary with static
+VM agent enclaves and a controlled gateway fixture, reads staged source and a
+fixture issue, tests denied tools/repositories/identities, returns a finite
+structured result and checks VM cleanup. It retains the harness's supported-runner,
+release-attestation and host credential prerequisites. Its gateway is a test
+double, not evidence that an unmodified production compiler/gateway supports
+the new contract. Gateway fixture tests separately exercise expiration.
+
+Threat-model decisions for this transport:
+
+| Threat | Boundary / mitigation |
+| --- | --- |
+| Primary steals or reuses enclave authority | Host-only custody, excluded environment variable, existing private-root isolation, invocation-only read-only export; no primary mount or transport receives the capability. |
+| Compromised guest steals host credentials | Guest receives only the scoped bearer; staging, repository, control and gateway-wide credentials remain outside its filesystem and environment. |
+| Guest widens tool/repository/integrity policy | Compiler configures gateway-side enforcement on every request; AWF checks exact handoff metadata and tool exposure. Guest MCP tool configuration alone is not authorization. |
+| Guest calls another service or bypasses gateway | Existing fixed-peer/port nftables policy and exact internal-network membership checks remain mandatory; no new relay or host listener is introduced. |
+| Replay after completion or crash | Gateway-enforced expiry and run teardown; VM/network/storage cleanup before release. Run-scoped reuse between admitted invocations is explicit, not a per-invocation revocation guarantee. |
 
 The agent enclave layers its Copilot/runtime on the primary's build-tools OCI
 image, sharing compilers, build libraries and utilities (including `gh`). The
@@ -1111,15 +1267,88 @@ For configured Docker tmpfs capacity `T`, the host writable allocation is also
 container tmpfs and shared memory, the aggregate is `3T + 64 MiB` for scripts
 and `3T` for agents. These are Docker-derived bounds, not VM storage defaults.
 
+### Unprivileged AWF orchestration with rootful Docker
+
+The default `gh-aw --rootless` mode means an unprivileged **AWF process**, not a
+rootless Docker daemon. Docker enclaves retain their rootful local daemon,
+namespace/identity checks and network restrictions. AWF without `CAP_SYS_ADMIN`
+uses the version-matched host storage helper installed by the authenticated
+`install.sh`. Run that installer using sudo as the workflow's host user; it
+installs a root-owned Python helper and an exact, noninteractive sudo rule for
+that numeric user. Installation as root without `SUDO_UID` does not authorize
+an additional user. npm/source installs alone do not install privileged support.
+Authenticated legacy releases whose signed checksum manifest predates the helper
+still install the ordinary CLI, with an explicit unsupported-helper warning;
+a listed helper may never be skipped on download or authentication failure.
+After authenticating a listed helper, installation detects missing interpreter/
+sudo prerequisites or unsupported host namespaces/capabilities and preserves
+ordinary CLI installation with an explicit unsupported-helper warning. Enclave
+preflight still fails closed until the matching helper is installed on a supported
+host; a signature/checksum failure is never treated as an unsupported-host skip.
+
+The only authorized command is `/usr/bin/python3 -I
+/var/lib/awf/enclave-storage-helper.py` with the helper's closed protocol.
+There is no helper-path override, generic mount/chown permission, setuid shell,
+credential forwarding, or privileged AWF orchestration. The helper verifies the
+installed version, host root identity and initial PID/user/mount namespaces.
+Its root-owned state and allocation parents live at
+`/var/lib/awf/enclave-storage`, outside every primary-agent and broker bind;
+preflight rejects overlapping mounts. Neither the helper script nor its state
+is present in the primary's system mounts. Preflight also bootstraps the caller's
+fixed, owner-only `host-state` directory beneath its root-owned user parent.
+Docker's durable journals and logical invocation roots use that directory,
+not the privileged Cloud Hypervisor journal defaults.
+Before allocation, the helper pins a private self-bind of that fixed root so
+new tmpfs mounts cannot propagate to shared peer mounts. Probe also requires
+effective host mount and ownership capabilities; namespace presence alone is
+not accepted as mount authority.
+
+Each allocation is a `nosuid,nodev,noexec` tmpfs, at most **4 GiB** (8 GiB and
+32 outstanding allocations per host user). Root-owned, fd-relative no-follow
+directory walks and a cross-process lock pin its identity. Ownership transfer
+is limited to the invocation's fixed writable/credential files and empty agent directory,
+always to the audited `65534:65534` identity;
+only the fixed output/session files can be reclaimed, against recorded inode
+identities. Repository credentials, payloads and caller environment are never
+sent to the helper. Normal result release still requires verified container
+removal before output reclaim and bounded reading.
+
+Helper intents and mount identities are retained through partial failures.
+Existing journal-led recovery must prove immutable container removal before
+requesting exact allocation cleanup; missing authorization, busy mounts, identity
+changes or uncertain completion preserve recovery state and fail closed.
+Reinstall/upgrade refuses outstanding helper allocations; reconcile them first.
+The existing direct privileged path remains available. Compiler-side adoption
+or changes in `github/gh-aw` are upstream work, not configuration changes in AWF.
+
 ### Docker acceptance scope
 
-`tests/integration/enclave-docker-host.test.ts` provides privileged real-daemon
+`tests/integration/enclave-docker-host.test.ts` provides real-daemon
 evidence on Linux with rootful Docker and cgroup v2. It exercises the audited
 script and agent entrypoints, substituting a local fixture for Copilot only.
 It verifies effective non-root identity, read-only seed/rootfs mounts, no-network
 scripts, the exact dedicated agent network, configured memory/PID limits and CPU
 quota, and one kernel-bounded allocation across output, session and runtime binds.
 Concurrent sparse writers exhaust that shared capacity with `ENOSPC`.
+Independent concurrent run IDs additionally prove distinct allocations and
+recovery journals while exercising separate helper processes under its lock.
+Run it as the unprivileged authorized user to exercise helper setup, fixed-file
+ownership, result reclaim and cleanup; run as root with `CAP_SYS_ADMIN` to
+exercise the backwards-compatible direct storage path. Select helper acceptance
+explicitly with `AWF_DOCKER_HOST_STORAGE_HELPER_ACCEPTANCE=1`; the existing
+`AWF_DOCKER_HOST_ACCEPTANCE=1` remains the privileged-path gate. It uses only local
+fixture engines, never a production provider or workflow dispatch.
+The coordinated case runs real `stageEnclaveSeeds` scrubbing/read-only staging
+with only Git network transport replaced, then starts the audited agent
+entrypoint, consumes its generated credential-isolated MCP configuration, calls
+allowed read tools against an internal controlled GitHub responder, rejects a
+write tool and another repository, releases a bounded result and verifies
+container/mount/journal cleanup. The responder models repository/tool policy;
+it is not evidence for a production mcpg controller or upstream compiler rollout.
+The suite intentionally constructs one set of minimal controlled fixtures from
+the production-pinned Python/Node bases and audited entrypoints/modules. It keeps
+confinement/network rules intact; production image builds, trust-store installation
+and external TLS remain separate validation concerns, not a fixture mode or bypass.
 Cancellation, host deadlines, broker lease expiry, host-service shutdown and
 SIGKILL orphan recovery remove verified containers and mounts; private-output
 sentinels and invalid results are not released. The authenticated broker client
@@ -1229,6 +1458,117 @@ Discovery follows replacement children when virtiofsd's temporary setup child
 exits, and waits for the parent capability drop before taking final evidence.
 An unsettled or changed worker still fails closed before its socket reaches
 the VM; namespace, root, environment, and cgroup checks remain mandatory.
+## Trusted Node bootstrap for gh-aw installers
+
+`scripts/security/enclave-installer-node.sh` is the shared host bootstrap contract
+for gh-aw's Docker storage-helper CJS installer and public diagnostic collector
+setup. It replaces runtime acquisition in `trustedEnclaveInstallerNodeLines`
+introduced by [github/gh-aw#73984](https://github.com/github/gh-aw/pull/73984).
+The upstream compiler integration is a separate change in gh-aw; adding this
+script does not change already-generated workflows.
+
+The script requires Linux x64 or ARM64, Bash, GNU coreutils, and root execution
+from authenticated, protected staging. It writes exactly one absolute canonical
+Node executable path to stdout; errors and package-manager output go to stderr.
+Its Node API baseline is >=20.19, matching AWF, not an exact distribution version.
+Selection order is:
+
+1. Explicit `--node-path /absolute/path` candidates (repeatable), then
+   `/usr/bin/node` and `/usr/local/bin/node`.
+2. The standard `actions/setup-node` tools-cache layout,
+   `/opt/hostedtoolcache/node/*/{x64,arm64}/bin/node`, or a cache root passed with
+   `--tool-cache /absolute/path`. The executable's actual version, platform and
+   architecture are checked, not inferred from directory names.
+3. With `--install`, refresh the system's authenticated APT repositories and
+   inspect the `nodejs` candidate before installing. APT installs only a candidate
+   at or above the Node >=20.19 baseline; repository update and candidate-query
+   failures are fatal. APT manages architecture, package authentication and its
+   normal download cache. No Node archive URL, tar member, architecture digest
+   table or AWF runtime distribution is maintained.
+4. With **both** `--install --allow-nodesource`, if the distribution has no
+   compatible candidate, use NodeSource's standard
+   `https://deb.nodesource.com/setup_lts.x` mechanism and inspect the refreshed
+   APT candidate before installing. This explicitly authorizes trusting
+   NodeSource's APT signing keys and the setup script whose SHA-256 is pinned in
+   the bootstrap. A changed script fails closed until its approved digest is
+   updated. The standard installer manages LTS selection, repository configuration
+   and x64/ARM64 package metadata; AWF does not duplicate them. The script is
+   fetched with system curl (ignoring curlrc, HTTPS-only redirects), into a
+   root-created mode-0700 directory under protected `/var/lib`, run with a clean
+   environment and readable APT configuration permissions, then removed.
+
+An administrator must configure an authenticated package source with a suitable
+Node package, explicitly permit NodeSource, or pre-provision a trusted
+runtime/cache on non-APT hosts. GitHub-hosted Ubuntu runners commonly have a
+runner-writable tools cache and only Node 18 in their default APT repositories;
+use the explicit NodeSource option there. Without that authorization, setup
+fails clearly rather than running an incompatible Node or adding a repository.
+Without `--install`, selection is offline and never changes installed packages.
+
+### Privileged-execution boundary
+
+Before any candidate is executed, symlinks are resolved and the executable and
+**every canonical ancestor through `/`** must be root-owned and not group- or
+world-writable. A runner-writable `PATH` entry or tools-cache installation is
+never executed as root, even to ask its version. Probes use `env -i`, a fixed
+system PATH, and `--no-addons --no-global-search-paths`; `NODE_OPTIONS`,
+`NODE_PATH`, loader variables and runner configuration are not inherited.
+
+Root ownership is a trust-policy prerequisite, not a way to authenticate
+previously untrusted bytes. A protected cache must have been provisioned through
+an authenticated administrator-controlled setup process, with protected
+ancestors from the start. Do **not** make an ordinary runner-owned setup-node
+cache eligible by copying/chowning it. Standard `actions/setup-node` remains
+appropriate for **unprivileged** downloader scripts; it does not by itself
+authenticate an executable for elevation. This assumes a trusted base OS and
+system utilities, as do the existing privileged installers.
+
+### Upstream replacement path
+
+In gh-aw, embed a reviewed copy of this shell source in the compiler (or fetch it
+at an immutable AWF revision with a compiler-pinned SHA-256). Stage it alongside
+the existing CJS installers in a root-created random directory under a protected
+`/var/lib` ancestor; install root-owned mode 0500 and verify the **staged**
+bootstrap digest before invoking it. Do not execute it from the checkout or a
+runner download directory with sudo.
+
+Replace `trustedEnclaveInstallerNodeLines`'s Node tarball acquisition/staging
+with a call to that authenticated bootstrap, for example:
+
+```bash
+# ROOT_STAGE and the bootstrap are already protected and authenticated.
+# CANDIDATE_NODE is only a hint: the root bootstrap validates it before use.
+trusted_node=$(sudo -n /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+  /bin/bash "$ROOT_STAGE/enclave-installer-node.sh" \
+  --node-path "$CANDIDATE_NODE" --tool-cache /opt/hostedtoolcache \
+  --install --allow-nodesource)
+sudo -n /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+  "$trusted_node" --no-addons --no-global-search-paths \
+  "$ROOT_STAGE/install_awf_enclave_helper.cjs" "$@"
+```
+
+Omit `--node-path` if no installed candidate is known; do not assume
+`/usr/bin/node` exists. Pass any runner-specific tools-cache location explicitly,
+since the privileged bootstrap does not read runner environment variables.
+Keep installer arguments explicit in generated workflows.
+
+Apply the same selection to `install_enclave_diagnostics.cjs` and
+`install_enclave_diagnostics_trusted.cjs`: remove their Node archive download,
+archive/executable pins, extraction and tarball-specific inputs. Keep the
+unprivileged collector download and all existing root-side size, regular-file,
+symlink, digest and protected-publication checks. When diagnostics need a stable
+interpreter after setup, install a private copy **from the validated protected
+canonical path**, not from runner staging, into their existing root-protected
+export directory, and use that absolute path for both `prepare` and `collect`
+under `env -i`.
+
+Do not remove the CJS installer checksums, collector checksum, AWF release
+manifest/provenance verification, protected staging, or clean privileged
+environment. Runtime selection replaces only the bespoke Node distribution.
+The separately authenticated `enclave-storage-helper.py` remains the storage
+helper; this integration adds no Python installer sources to gh-aw's
+`actions/setup/`.
+
 ## Coverage after legacy smoke removal
 
 The experimental Cloud Hypervisor Copilot enclave smoke is distinct from

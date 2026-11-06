@@ -9,13 +9,17 @@ import {
   NvxManager,
   type NvxLaunchExecutor,
   type NvxManagerDependencies,
+  type NvxGuestConfigLifecycle,
 } from './manager';
 import { DirectOpenvmmLaunchExecutor } from './launch-executor';
 import type { NvxPreflightResult } from './preflight';
 
 const RUN_ID = 'a'.repeat(32);
 
-function harness(overrides: Partial<NvxManagerDependencies> = {}) {
+function harness(
+  overrides: Partial<NvxManagerDependencies> = {},
+  guestConfig?: NvxGuestConfigLifecycle,
+) {
   const order: string[] = [];
   const cleanupHandle: NvxCleanupHandle = {
     record: {} as never,
@@ -189,6 +193,7 @@ function harness(overrides: Partial<NvxManagerDependencies> = {}) {
     filesystem: { workDir: '/work', layers: [{ role: 'distro', sourcePath: '/rootfs' }] },
     execution: { entrypoint: '/bin/true' },
     network: { infrastructureBridge: 'awfbr0', enableApiProxy: false },
+    guestConfig,
   }, dependencies);
   return {
     manager, dependencies, order, cleanupHandle, launchExecutor, network,
@@ -197,6 +202,32 @@ function harness(overrides: Partial<NvxManagerDependencies> = {}) {
 }
 
 describe('NvxManager', () => {
+  it('passes guest configuration as an ownership-preserving merge source for one distro image', async () => {
+    const guestConfig = {
+      stage: jest.fn(async () => '/configuration-source'),
+      cleanup: jest.fn(async () => undefined),
+    };
+    const value = harness({}, guestConfig);
+    await expect(value.manager.execute()).resolves.toMatchObject({ exitCode: 0 });
+    expect(guestConfig.stage).toHaveBeenCalledTimes(1);
+    expect(value.dependencies.createFilesystem).toHaveBeenCalledWith(expect.objectContaining({
+      layers: [
+        { role: 'distro', sourcePath: '/rootfs' },
+        { role: 'custom', sourcePath: '/configuration-source', preserveOwnership: true },
+      ],
+    }));
+    const launch = jest.mocked(value.launchExecutor.execute).mock.calls[0][0];
+    expect(JSON.stringify(launch.plan.launchCommand)).toContain('distro:file:/proc/self/fd/6,ro');
+    expect(JSON.stringify(launch.plan.launchCommand)).not.toContain('custom.erofs');
+    expect(launch.request.filesystem.layers).toEqual([
+      expect.objectContaining({
+        role: 'distro',
+        path: `/var/lib/awf-nvx/runs/${RUN_ID}/distro.erofs`,
+      }),
+    ]);
+    expect(guestConfig.cleanup).toHaveBeenCalledTimes(1);
+  });
+
   it('wires the production direct OpenVMM executor by default', () => {
     expect(createDefaultNvxManagerDependencies().launchExecutor)
       .toBeInstanceOf(DirectOpenvmmLaunchExecutor);
@@ -229,6 +260,29 @@ describe('NvxManager', () => {
       'record-complete',
     ]);
     expect(value.cleanupHandle.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns existing console tails and guest exit status after the disposable execution is cleaned', async () => {
+    const value = harness();
+    const execute = jest.mocked(value.launchExecutor.execute);
+    const launch = execute.getMockImplementation()!;
+    const stdout = Buffer.from('NVX-SANDBOX-READY: pid=1 layers=1\n1.2.3\nNVX-SANDBOX-EXIT: status=7\n');
+    const stderr = Buffer.from('fixture version error\n');
+    execute.mockImplementation(async (options) => ({
+      ...await launch(options),
+      exitCode: 7,
+      category: 'guest-exit',
+      rawStdoutTail: stdout,
+      rawStderrTail: stderr,
+    }));
+
+    const result = await value.manager.execute();
+    expect(result).toMatchObject({
+      exitCode: 7, category: 'guest-exit', rawStdoutTail: stdout, rawStderrTail: stderr,
+    });
+    expect(value.filesystemBuilder.cleanup).toHaveBeenCalledTimes(1);
+    expect(value.cleanupHandle.complete).toHaveBeenCalledTimes(1);
+    expect(result.rawStdoutTail.toString()).not.toBe('1.2.3\n');
   });
 
   it('rolls back partial setup and retains the record when cleanup fails', async () => {

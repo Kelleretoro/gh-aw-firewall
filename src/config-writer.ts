@@ -1,6 +1,5 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as yaml from 'js-yaml';
 import execa from 'execa';
 import { WrapperConfig, API_PROXY_PORTS, DockerComposeConfig } from './types';
 import { logger } from './logger';
@@ -10,6 +9,7 @@ import { generateSessionCa, initSslDb, isOpenSslAvailable } from './ssl-bump';
 import { parseUrlPatterns } from './domain-matchers';
 import { SslConfig, SQUID_PORT } from './host-env';
 import { generateDockerCompose, redactDockerComposeSecrets } from './compose-generator';
+import { renderDockerCompose } from './compose-renderer';
 import { collectResolvedRuntimeImages } from './image-resolver';
 import { deriveSensitiveEndpointForms, redactSensitiveValues } from './redact-secrets';
 import { resolveLogPaths } from './log-paths';
@@ -26,6 +26,9 @@ import {
   resolveSensitivePaths,
 } from './sensitive-paths';
 import { writeSensitivePathAudit } from './sensitive-path-audit';
+import { resolveApiProxyUpstreams } from './services/api-proxy-env-config';
+import { copilotBrokerSensitiveValues, resolveCopilotBrokerUpstreams } from './copilot-token-broker';
+import { prepareHarnessObservation } from './harness-observation';
 
 // When bundled with esbuild, this global is replaced at build time with the
 // JSON content of containers/agent/seccomp-profile.json.  In normal (tsc)
@@ -443,7 +446,10 @@ function writeAuditArtifacts(
   // Secret-derived endpoints (e.g. an OpenAI base URL supplied through
   // `apiProxy.targets.openai.baseUrlEnv`) must never appear in audit artifacts,
   // so redact their URL/host/host:port forms from the snapshots below.
-  const sensitiveEndpointForms = deriveSensitiveEndpointForms(config.sensitiveAllowedDomains);
+  const sensitiveEndpointForms = [
+    ...deriveSensitiveEndpointForms(config.sensitiveAllowedDomains),
+    ...copilotBrokerSensitiveValues(config),
+  ];
 
   // Save squid.conf for audit (domain ACLs and proxy config, sensitive hosts redacted)
   writeAuditArtifact(
@@ -452,12 +458,12 @@ function writeAuditArtifacts(
     redactSensitiveValues(squidConfig, sensitiveEndpointForms)
   );
 
-  // Save redacted docker-compose.yml (strip env vars that may contain secrets)
-  const redactedCompose = redactDockerComposeSecrets(dockerCompose, sensitiveEndpointForms);
+  // Save a default-redacted snapshot, leaving runtime config intact.
+  const redactedCompose = redactDockerComposeSecrets(dockerCompose);
   writeAuditArtifact(
     auditDir,
     'docker-compose.redacted.yml',
-    yaml.dump(redactedCompose, { lineWidth: -1 })
+    renderDockerCompose(redactedCompose)
   );
 
   // Effective infrastructure images, recorded centrally by the image resolver
@@ -480,6 +486,8 @@ function writeAuditArtifacts(
     dnsServers: squidDnsServers ?? config.dnsServers,
     ...(config.enableApiProxy && networkConfig.proxyIp ? {
       apiProxyIp: networkConfig.proxyIp,
+      apiProxyUpstreams: resolveApiProxyUpstreams(config),
+      apiProxyBrokerUpstreams: resolveCopilotBrokerUpstreams(config),
     } : {}),
     // Include topology peer allow rules so the audit log correctly attributes
     // allowed connections to topology-attached containers (e.g. awmg-mcpg:8080)
@@ -493,7 +501,7 @@ function writeAuditArtifacts(
   writeAuditArtifact(
     auditDir,
     'policy-manifest.json',
-    JSON.stringify(policyManifest, null, 2)
+    redactSensitiveValues(JSON.stringify(policyManifest, null, 2), sensitiveEndpointForms)
   );
 
   if (config.nvx) {
@@ -548,6 +556,7 @@ export async function writeConfigs(config: WrapperConfig): Promise<void> {
   // Phase 2: Log-path resolution and directory preparation
   const logPaths = resolveLogPaths(config);
   prepareWorkDirectories(config, logPaths);
+  prepareHarnessObservation(config);
   repairRunnerTempGhAwOwnership();
   repairContainerWorkDirOwnership(config);
 
@@ -602,7 +611,12 @@ export async function writeConfigs(config: WrapperConfig): Promise<void> {
     // all necessary egress without exposing the sensitive hostnames in logs or
     // the audit artifact (where only config.allowedDomains is serialised).
     domains: [...config.allowedDomains, ...(config.sensitiveAllowedDomains ?? [])],
-    sensitiveDomains: config.sensitiveAllowedDomains,
+    sensitiveDomains: [
+      ...(config.sensitiveAllowedDomains ?? []),
+      ...(config.copilotTokenBroker
+        ? (resolveCopilotBrokerUpstreams(config).slice(0, 2).map(endpoint => endpoint.hostname))
+        : []),
+    ],
     blockedDomains: config.blockedDomains,
     port: SQUID_PORT,
     sslBump: config.sslBump,
@@ -619,6 +633,8 @@ export async function writeConfigs(config: WrapperConfig): Promise<void> {
     // to the api-proxy via HTTP_PROXY without honouring NO_PROXY for raw IPs.
     ...(config.enableApiProxy && networkConfig.proxyIp ? {
       apiProxyIp: networkConfig.proxyIp,
+      apiProxyUpstreams: resolveApiProxyUpstreams(config),
+      apiProxyBrokerUpstreams: resolveCopilotBrokerUpstreams(config),
       apiProxyPorts: Object.values(API_PROXY_PORTS),
     } : {}),
     ...(config.difcProxyHost && networkConfig.cliProxyIp ? {
@@ -640,9 +656,7 @@ export async function writeConfigs(config: WrapperConfig): Promise<void> {
   // environment variables (tokens, API keys) in plaintext
   const dockerCompose = generateDockerCompose(config, networkConfig, sslConfig, squidConfig);
   const dockerComposePath = path.join(config.workDir, 'docker-compose.yml');
-  // lineWidth: -1 disables line wrapping to prevent base64-encoded values
-  // (like AWF_SQUID_CONFIG_B64) from being split across multiple lines
-  fs.writeFileSync(dockerComposePath, yaml.dump(dockerCompose, { lineWidth: -1 }), { mode: 0o600 });
+  fs.writeFileSync(dockerComposePath, renderDockerCompose(dockerCompose), { mode: 0o600 });
   logger.debug(`Docker Compose config written to: ${dockerComposePath}`);
 
   // Phase 7: Audit artifact writing

@@ -7,7 +7,11 @@ dist/
 *.tgz
 coverage/
 .nyc_output/
+/artifacts/cloud-hypervisor-harness-*/
+/artifacts/harness-cloud-hypervisor*/
 /.ch-unified-*/
+/.nvx-test-temp/
+/.awf-nvx-process-*/
 /awf-enclave-private-*/
 *.swp
 *.swo

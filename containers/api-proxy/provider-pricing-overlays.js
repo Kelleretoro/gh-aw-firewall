@@ -1,22 +1,21 @@
 'use strict';
 
+const { selectPricingFact } = require('./catalogue-contract/pricing-resolution');
+const exact = require('./catalogue-contract/exact-pricing');
 const DOLLARS_PER_TOKEN_TO_DOLLARS_PER_MILLION = 1_000_000;
 
 let cachedRaw;
 let cachedProviders = null;
 
-function canonicalizeModel(model) {
+function canonicalizeModel(model, preserveNamespace = false) {
   if (!model || typeof model !== 'string') return '';
-  const bare = model.includes('/') ? model.slice(model.indexOf('/') + 1) : model;
+  const bare = !preserveNamespace && model.includes('/') ? model.slice(model.indexOf('/') + 1) : model;
   return bare.replace(/[._]/g, '-').toLowerCase();
 }
 
 function parseDollarsPerToken(value) {
-  if ((typeof value !== 'number' && typeof value !== 'string') ||
-      (typeof value === 'string' && value.trim() === '')) return null;
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 0) return null;
-  return parsed * DOLLARS_PER_TOKEN_TO_DOLLARS_PER_MILLION;
+  if (value === undefined) return null;
+  return exact.multiply(exact.decimal(value), exact.decimal(DOLLARS_PER_TOKEN_TO_DOLLARS_PER_MILLION));
 }
 
 function normalizeCostRates(cost) {
@@ -25,7 +24,7 @@ function normalizeCostRates(cost) {
   const output = parseDollarsPerToken(cost.output);
   if (input === null || output === null) return null;
   const cachedInput = cost.cache_read === undefined
-    ? input * 0.1
+    ? exact.multiply(input, exact.decimal('0.1'))
     : parseDollarsPerToken(cost.cache_read);
   const cacheWrite = cost.cache_write === undefined
     ? null
@@ -36,13 +35,13 @@ function normalizeCostRates(cost) {
   if (cachedInput === null ||
       (cost.cache_write !== undefined && cacheWrite === null) ||
       (cost.reasoning !== undefined && reasoning === null)) return null;
-  return {
+  return exact.fromExact({
     input,
     cachedInput,
     cacheWrite,
     output,
     ...(reasoning !== undefined ? { reasoning } : {}),
-  };
+  });
 }
 
 function normalizeCost(cost) {
@@ -59,7 +58,8 @@ function normalizeCost(cost) {
   const longContext = normalizeCostRates(rawLongContext);
   const threshold = rawLongContext.max_prompt_tokens;
   if (!longContext || !Number.isFinite(threshold) || threshold <= 0) return null;
-  return { default: defaultTier, longContext: { ...longContext, threshold } };
+  longContext.threshold = threshold;
+  return { default: defaultTier, longContext };
 }
 
 function getProviderAliases(provider) {
@@ -85,7 +85,7 @@ function getProviders() {
   return cachedProviders;
 }
 
-function resolveProviderPricingOverlay(provider, model, inputTokens = 0) {
+function getProviderPricingFact(provider, model, options = {}) {
   const providers = getProviders();
   if (!providers || !provider || !model) return null;
   let models = null;
@@ -98,10 +98,10 @@ function resolveProviderPricingOverlay(provider, model, inputTokens = 0) {
   }
   if (!models) return null;
 
-  const canonical = canonicalizeModel(model);
+  const canonical = canonicalizeModel(model, options.preserveNamespace === true);
   let match = null;
   for (const [configuredModel, entry] of Object.entries(models)) {
-    const configuredCanonical = canonicalizeModel(configuredModel);
+    const configuredCanonical = canonicalizeModel(configuredModel, options.preserveNamespace === true);
     if (configuredCanonical === canonical ||
         (canonical.startsWith(`${configuredCanonical}-`) &&
           (!match || configuredCanonical.length > match.canonical.length))) {
@@ -111,14 +111,13 @@ function resolveProviderPricingOverlay(provider, model, inputTokens = 0) {
   }
   const normalized = normalizeCost(match?.entry?.cost);
   if (!normalized) return null;
-  const useLongContext = !!normalized.longContext &&
-    inputTokens > normalized.longContext.threshold;
-  const pricing = useLongContext ? normalized.longContext : normalized.default;
   return {
-    pricing,
-    source: 'operator',
-    tier: useLongContext ? 'long_context' : 'default',
+    source: 'operator', ...normalized, threshold: normalized.longContext?.threshold,
   };
+}
+
+function resolveProviderPricingOverlay(provider, model, inputTokens = 0) {
+  return selectPricingFact(getProviderPricingFact(provider, model), inputTokens);
 }
 
 function resetProviderPricingOverlaysForTests() {
@@ -127,7 +126,16 @@ function resetProviderPricingOverlaysForTests() {
 }
 
 module.exports = {
+  getProviderPricingModelIds: provider => {
+    const providers = getProviders();
+    for (const alias of getProviderAliases(provider)) {
+      const models = providers?.[alias]?.models;
+      if (models && typeof models === 'object' && !Array.isArray(models)) return Object.keys(models);
+    }
+    return [];
+  },
   getProviderAliases,
+  getProviderPricingFact,
   resolveProviderPricingOverlay,
   resetProviderPricingOverlaysForTests,
 };

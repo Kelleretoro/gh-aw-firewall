@@ -1,11 +1,12 @@
 'use strict';
 
-const TOKENS_PER_MILLION = 1_000_000;
-const DOLLARS_PER_AIU = 0.01;
+const { selectPricingFact } = require('./catalogue-contract/pricing-resolution');
+const exact = require('./catalogue-contract/exact-pricing');
 const NANO_AIU_PER_AIU = 1_000_000_000;
 const GEMINI_MODEL_NAME_PREFIX = 'models/';
 
 const runtimeCatalog = Object.create(null);
+const captureTimes = new WeakMap();
 
 function canonicalizeModel(model) {
   if (!model || typeof model !== 'string') return '';
@@ -26,10 +27,9 @@ function normalizeModelId(entry, format) {
 
 function normalizePrice(value, batchSize, unit) {
   if (value === undefined || value === null) return null;
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric < 0 || !Number.isFinite(batchSize) || batchSize <= 0) return null;
-  const aiu = unit === 'nano_aiu' ? numeric / NANO_AIU_PER_AIU : numeric;
-  return aiu * DOLLARS_PER_AIU * (TOKENS_PER_MILLION / batchSize);
+  const numeric = exact.decimal(value);
+  const aiu = unit === 'nano_aiu' ? exact.divide(numeric, exact.decimal(NANO_AIU_PER_AIU)) : numeric;
+  return exact.divide(exact.multiply(aiu, exact.decimal(10000)), exact.decimal(batchSize));
 }
 
 function normalizeTier(rawTier, batchSize, unit) {
@@ -44,20 +44,21 @@ function normalizeTier(rawTier, batchSize, unit) {
   );
   const cacheWrite = normalizePrice(rawTier.cache_write_price, batchSize, unit);
   const threshold = Number(rawTier.max_prompt_tokens ?? rawTier.context_max);
-  return {
+  return exact.fromExact({
     input,
     output,
     ...(cachedInput !== null ? { cachedInput } : {}),
     ...(cacheWrite !== null ? { cacheWrite } : {}),
     ...(Number.isFinite(threshold) && threshold > 0 ? { threshold } : {}),
-  };
+  });
 }
 
 function normalizeCopilotPricing(entry) {
   const tokenPrices = entry?.billing?.token_prices;
   if (!tokenPrices || typeof tokenPrices !== 'object') return null;
-  const batchSize = Number(tokenPrices.batch_size);
-  if (!Number.isFinite(batchSize) || batchSize <= 0) return null;
+  const batchSize = tokenPrices.batch_size;
+  if (batchSize === undefined || batchSize === null) return null;
+  if (exact.compare(exact.decimal(batchSize), exact.ZERO) <= 0) throw new Error('pricing_decimal_invalid_batch');
 
   let defaultTier;
   let longContext;
@@ -103,7 +104,15 @@ function parseProviderModelMetadata(provider, json, options = {}) {
   const records = entries.map(entry => {
     const id = normalizeModelId(entry, format);
     if (!id) return null;
-    const pricing = format === 'copilot' ? normalizeCopilotPricing(entry) : null;
+    let pricing;
+    let pricingError = false;
+    try {
+      pricing = format === 'copilot' ? normalizeCopilotPricing(entry) : null;
+    } catch {
+      // Discovery catches fetch failures. Retain an invalid tariff as a fact so
+      // accounting cannot silently reuse old/lower-priority/free pricing.
+      pricingError = true;
+    }
     const promotion = format === 'copilot' ? normalizePromotion(entry) : null;
     const displayName = entry.display_name || entry.displayName || (entry.id ? entry.name : null);
     return {
@@ -126,6 +135,7 @@ function parseProviderModelMetadata(provider, json, options = {}) {
         ? { modelPickerEnabled: entry.model_picker_enabled }
         : {}),
       ...(pricing ? { pricing } : {}),
+      ...(pricingError ? { pricingError: true } : {}),
       ...(promotion ? { promotion } : {}),
     };
   }).filter(Boolean);
@@ -141,7 +151,7 @@ function replaceRuntimeModels(provider, records) {
   );
   runtimeCatalog[provider] = records.map(record => {
     const previous = previousById.get(canonicalizeModel(record.id));
-    if (!previous?.pricing) return record;
+    if (record.pricingError || !previous?.pricing) return record;
     const defaultTier = chooseTier(record.pricing?.default, previous.pricing.default);
     const longContext = chooseTier(record.pricing?.longContext, previous.pricing.longContext);
     const pricingProvenance = {
@@ -221,22 +231,21 @@ function findRuntimeModel(provider, model, catalog = runtimeCatalog) {
   return records.find(record => canonicalizeModel(record.id) === canonical) || null;
 }
 
-function resolveRuntimePricing(provider, model, inputTokens = 0, catalog = runtimeCatalog) {
+function getRuntimePricingFact(provider, model, catalog = runtimeCatalog) {
   const record = findRuntimeModel(provider, model, catalog);
+  if (record?.pricingError) throw new Error('pricing_resolution_invalid_tariff');
   if (!record?.pricing?.default) return null;
   const longContext = record.pricing.longContext;
   const threshold = record.pricing.default.threshold;
-  const useLongContext = !!longContext && !!threshold && inputTokens > threshold;
-  const tier = useLongContext ? longContext : record.pricing.default;
-  const tierName = useLongContext ? 'longContext' : 'default';
-  const provenance = getTierProvenance(record, tierName);
   return {
-    pricing: tier,
-    source: 'provider',
-    tier: useLongContext ? 'long_context' : 'default',
-    observedAt: provenance.observedAt,
-    apiVersion: provenance.apiVersion,
+    source: 'provider', ...record.pricing, threshold: threshold || undefined,
+    defaultMetadata: getTierProvenance(record, 'default'),
+    longMetadata: longContext ? getTierProvenance(record, 'longContext') : undefined,
   };
+}
+
+function resolveRuntimePricing(provider, model, inputTokens = 0, catalog = runtimeCatalog) {
+  return selectPricingFact(getRuntimePricingFact(provider, model, catalog), inputTokens);
 }
 
 function getRuntimeCatalogSnapshot() {
@@ -247,6 +256,7 @@ function getRuntimeCatalogSnapshot() {
       source: record.source,
       observed_at: record.observedAt,
       ...(record.apiVersion ? { api_version: record.apiVersion } : {}),
+      ...(record.pricingError ? { pricing_error: 'pricing_resolution_error' } : {}),
       ...getWireApiReflectFields(record),
       ...(record.pricing ? {
         pricing: {
@@ -267,6 +277,7 @@ function getRuntimeCatalogSnapshot() {
 }
 
 module.exports = {
+  getRuntimePricingFact,
   canonicalizeModel,
   parseProviderModelMetadata,
   replaceRuntimeModels,
@@ -274,7 +285,21 @@ module.exports = {
   getRuntimeModels,
   findRuntimeModel,
   resolveRuntimePricing,
-  captureRuntimePricing: () => structuredClone(runtimeCatalog),
+  getRuntimePricingCaptureTime: (catalog, provider) =>
+    captureTimes.get(catalog[provider]) ?? captureTimes.get(catalog) ?? Date.now(),
+  captureRuntimePricing: () => {
+    const snapshot = Object.fromEntries(Object.entries(runtimeCatalog).map(([provider, records]) =>
+      [provider, records.map(record => ({
+        ...structuredClone(record),
+        ...(record.pricing ? { pricing: Object.fromEntries(Object.entries(record.pricing).map(([tier, prices]) =>
+          [tier, exact.rates(prices)])) } : {}),
+      }))]));
+    const time = Date.now();
+    captureTimes.set(snapshot, time);
+    // Request routing merges backend captures while retaining their record arrays.
+    for (const records of Object.values(snapshot)) captureTimes.set(records, time);
+    return snapshot;
+  },
   getRuntimeCatalogSnapshot,
   testHelpers: {
     normalizeCopilotPricing,

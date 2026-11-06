@@ -247,6 +247,7 @@ program
   .option('--nvx-scratch-bytes <bytes>', 'Bounded per-run guest-writable scratch overlay size in bytes.')
 
   // -- Container Configuration --
+  .option('--copilot-token-broker', 'Use host GitHub Actions OIDC to obtain renewable Copilot credentials from the token broker')
   .option(
     '-e, --env <KEY=VALUE>',
     'Environment variable for the container (repeatable)',
@@ -273,6 +274,11 @@ program
     'Volume mount (repeatable). Format: host_path:container_path[:ro|rw]',
     (value: string, previous: string[] = []) => [...previous, value],
     []
+  )
+  .option(
+    '--input-dir <path>',
+    'Require a non-empty, readable sandbox-visible input directory before running the command (repeatable; does not grant engine scope)',
+    collectStringArray
   )
   .option(
     '--container-workdir <dir>',

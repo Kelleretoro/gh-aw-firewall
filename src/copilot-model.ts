@@ -1,4 +1,10 @@
 import lifecycle from './model-information.compat.generated.json';
+import naming from './model-information.naming.generated.json';
+import { resolveIdentity } from './model-information-contract/resolution';
+import eligibilityModels from './model-information.eligibility.generated.json';
+import {
+  createEligibilityStore, EligibilityInput, EligibilitySnapshot, HarnessRequirement, EligibilityResult,
+} from './model-information-contract/eligibility';
 
 interface CopilotModelValidationSuccess {
   valid: true;
@@ -9,19 +15,12 @@ interface CopilotModelValidationFailure {
   valid: false;
   reason: 'retired' | 'unsupported';
   message: string;
+  eligibility?: EligibilityResult;
 }
 
 type CopilotModelValidationResult =
   | CopilotModelValidationSuccess
   | CopilotModelValidationFailure;
-
-/**
- * Normalize separators (`.` and `_`) to `-` for separator-agnostic model matching.
- * Mirrors the canonicalization used by api-proxy `canonicalizeModel()` helpers.
- */
-function normalizeSeparators(s: string): string {
-  return s.replace(/[._]/g, '-');
-}
 
 const RETIRED_COPILOT_MODEL_ALIASES = new Map(Object.entries(lifecycle.retired));
 
@@ -32,15 +31,19 @@ const RETIRED_COPILOT_MODEL_ALIASES = new Map(Object.entries(lifecycle.retired))
  */
 const SUPPORTED_COPILOT_MODELS = new Set(lifecycle.supported);
 
-/** Maps separator-normalized names (all `-`) → canonical model name. */
-const NORMALIZED_TO_CANONICAL = new Map<string, string>(
-  [...SUPPORTED_COPILOT_MODELS].map(m => [normalizeSeparators(m), m]),
-);
+const CLI_NAMING = {
+  models: naming.models.filter(model => SUPPORTED_COPILOT_MODELS.has(model.identity.rawId) ||
+    RETIRED_COPILOT_MODEL_ALIASES.has(model.identity.rawId)),
+};
+const CLI_ELIGIBILITY = createEligibilityStore({
+  models: eligibilityModels.models as {
+    identity: typeof CLI_NAMING.models[number]['identity']; harnesses: HarnessRequirement[];
+  }[],
+}).pin();
 
-/** Maps separator-normalized retired alias keys → canonical replacement. */
-const NORMALIZED_RETIRED_ALIASES = new Map<string, string>(
-  [...RETIRED_COPILOT_MODEL_ALIASES].map(([k, v]) => [normalizeSeparators(k), v]),
-);
+type CopilotModelEvidence = Omit<EligibilityInput, 'identity' | 'scope'> & {
+  snapshot?: EligibilitySnapshot;
+};
 
 function suggestionFor(model: string): string | undefined {
   let best: { candidate: string; distance: number } | undefined;
@@ -76,17 +79,21 @@ export const testHelpers = {
   supportedCopilotModels: new Set(SUPPORTED_COPILOT_MODELS) as ReadonlySet<string>,
 };
 
-export function validateCopilotModel(rawModel: string): CopilotModelValidationResult {
+export function validateCopilotModel(
+  rawModel: string, evidence: CopilotModelEvidence = {},
+): CopilotModelValidationResult {
   const trimmed = rawModel.trim();
   if (!trimmed) {
     return { valid: true, resolvedModel: trimmed };
   }
   const normalized = trimmed.toLowerCase();
-  const separatorNormalized = normalizeSeparators(normalized);
+  const resolution = resolveIdentity(trimmed, { provider: 'copilot', channel: 'copilot-cli' },
+    CLI_NAMING, { caseInsensitive: true, separators: true, providerPrefix: false });
+  // CLI validation deliberately excludes API parameter syntax and family-level guesses.
+  const canonicalModel = !resolution.parameterSuffix &&
+    ['exact', 'alias'].includes(resolution.matchKind) ? resolution.wireId : undefined;
 
-  // Check retired aliases (exact, then separator-normalized)
-  const retiredReplacement =
-    RETIRED_COPILOT_MODEL_ALIASES.get(normalized) ?? NORMALIZED_RETIRED_ALIASES.get(separatorNormalized);
+  const retiredReplacement = canonicalModel && RETIRED_COPILOT_MODEL_ALIASES.get(canonicalModel);
   if (retiredReplacement) {
     return {
       valid: false,
@@ -95,16 +102,39 @@ export function validateCopilotModel(rawModel: string): CopilotModelValidationRe
     };
   }
 
-  // Exact match
-  if (SUPPORTED_COPILOT_MODELS.has(normalized)) {
-    return { valid: true, resolvedModel: normalized };
-  }
-
-  // Separator-normalized match: treat `.`, `_`, `-` as equivalent
-  const canonicalModel = NORMALIZED_TO_CANONICAL.get(separatorNormalized);
-  if (canonicalModel) {
+  if (canonicalModel && SUPPORTED_COPILOT_MODELS.has(canonicalModel)) {
+    if (resolution.identity) {
+      const { snapshot = CLI_ELIGIBILITY, ...explicit } = evidence;
+      const eligibility = snapshot.evaluate({
+        ...explicit, identity: resolution.identity,
+        scope: { provider: 'copilot', channel: 'copilot-cli' },
+        discovery: explicit.discovery || { status: 'available', authoritative: true },
+      });
+      if (!eligibility.admitted) {
+        return {
+          valid: false, reason: 'unsupported', eligibility,
+          message: `Error: model '${trimmed}' is not eligible for Copilot CLI: ${
+            eligibility.reasons.filter(reason =>
+              !['discovery_unknown', 'harness_compatible'].includes(reason.code))
+              .map(reason => {
+                if (!reason.required) return reason.reason
+                  ? `${reason.code}: ${reason.reason}` : reason.code;
+                const required = reason.required;
+                return `${reason.code} (${reason.name}; scope=${JSON.stringify(reason.scope)}; ` +
+                  `environment=${reason.environment || 'unverified'}; ` +
+                  `required ${required.scheme} >=${required.minimum}; ` +
+                  `excluded=${JSON.stringify(required.excludedRanges)}; ` +
+                  `detected=${reason.detected || 'unverified'}${
+                    reason.reason ? `; ${reason.reason}` : ''}${
+                    reason.observationReason ? `; observation=${reason.observationReason}` : ''})`;
+              }).join(', ')
+          }.`,
+        };
+      }
+    }
     return { valid: true, resolvedModel: canonicalModel };
   }
+  if (normalized === 'auto') return { valid: true, resolvedModel: 'auto' };
 
   const suggested = suggestionFor(normalized);
   return {

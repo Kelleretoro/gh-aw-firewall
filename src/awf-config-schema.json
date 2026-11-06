@@ -6,6 +6,10 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "enclaveDebugPublic": {
+      "type": "boolean",
+      "description": "Retain bounded redacted host-only diagnostics for verified static public-only Docker or Cloud Hypervisor enclaves. False disables automatic capture."
+    },
     "$schema": {
       "type": "string",
       "description": "JSON Schema URL for IDE validation and autocomplete."
@@ -112,6 +116,10 @@
       "description": "API proxy sidecar configuration. The sidecar injects real API credentials so the agent never has direct access to them.",
       "additionalProperties": false,
       "properties": {
+        "copilotTokenBroker": {
+          "type": "boolean",
+          "description": "Explicitly use host GitHub Actions OIDC and the runtime token broker for Copilot credentials."
+        },
         "enabled": {
           "type": "boolean",
           "deprecated": true,
@@ -245,12 +253,22 @@
         },
         "maxAiCredits": {
           "type": "number",
-          "exclusiveMinimum": 0,
-          "description": "Maximum cumulative AI credits allowed for a run. When reached, the API proxy rejects subsequent requests with HTTP 403 and error type 'ai_credits_limit_exceeded'. With apiProxy.enableTokenSteering, advisory notices are queued at 80%, 90%, 95%, and 99% of the effective limit. AWF also enforces a non-overridable hard cap of 10,000 AI credits; values above 10,000 are effectively clamped."
+          "anyOf": [
+            {
+              "enum": [
+                -1,
+                0
+              ]
+            },
+            {
+              "exclusiveMinimum": 0
+            }
+          ],
+          "description": "Maximum cumulative accounted AI credits allowed for a run. Set to -1 or 0 to disable the configured budget (the hard cap still applies). When reached, the API proxy rejects subsequent requests with HTTP 403 and error type 'ai_credits_limit_exceeded'. With apiProxy.enableTokenSteering, advisory notices are queued at 80%, 90%, 95%, and 99% of the effective limit. AWF also enforces a non-overridable hard cap of 10,000 accounted AI credits; values above 10,000 are effectively clamped. Models without resolvable pricing are allowed with a warning and unpriced usage is excluded from totals, so actual spending may exceed these limits."
         },
         "defaultAiCreditsPricing": {
           "type": "object",
-          "description": "Fallback per-token pricing ($/1M tokens) for models not in a configured pricing catalog. When maxAiCredits is active and a model is unrecognized, this rate is used. If not set, unrecognized models are rejected with HTTP 400 (type: unknown_model_ai_credits).",
+          "description": "Fallback per-token pricing ($/1M tokens) for models without resolvable catalog pricing. If not set, unpriced models are allowed with a warning and their unpriced usage is excluded from AI-credit totals, so budget enforcement may undercount spending.",
           "required": [
             "input",
             "output"

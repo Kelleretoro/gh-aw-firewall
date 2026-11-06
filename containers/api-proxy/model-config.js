@@ -17,10 +17,11 @@ const {
   ALLOWED_MODELS,
   DISALLOWED_MODELS,
 } = require('./guards/model-policy-guard');
-const { isModelPriceable } = require('./guards/ai-credits-guard');
 const { parseScopedAutoRequest, rewriteScopedAutoRequest, pickerError } = require('./scoped-auto-model');
 const { parseBodyAsObject } = require('./body-utils');
 const { resolveModelSelector } = require('./model-selector');
+const { captureRuntimePricing } = require('./runtime-model-catalog');
+const { pinRequestEligibility, isModelEligible, isModelHarnessEligible } = require('./model-eligibility');
 
 const MODEL_ALIASES_RAW = (process.env.AWF_MODEL_ALIASES || '').trim() || undefined;
 const MODEL_ALIASES = parseModelAliases(MODEL_ALIASES_RAW);
@@ -82,23 +83,6 @@ logRequest('info', 'startup', {
   model_fallback: MODEL_FALLBACK,
 });
 
-/**
- * Build a predicate that reports whether the AI-credits guard can price a model.
- *
- * Used to keep the middle-power fallback from synthesizing a model that the
- * guard would immediately reject. Returns null (no filtering) unless the guard
- * is actually active — i.e. a credit cap is set with no configured default
- * pricing — so pricing coverage never constrains resolution otherwise.
- *
- * @param {string} provider
- * @returns {((model: string) => boolean)|null}
- */
-function makeIsModelPriceable(provider) {
-  if (!process.env.AWF_MAX_AI_CREDITS) return null;
-  if (process.env.AWF_DEFAULT_AI_CREDITS_PRICING) return null;
-  return (model) => isModelPriceable(model, provider);
-}
-
 function getModelFallbackPolicyForProvider(provider) {
   if (MODEL_FALLBACK.excludeEngines && MODEL_FALLBACK.excludeEngines.includes(provider.toLowerCase())) {
     return {
@@ -114,8 +98,7 @@ function getModelFallbackPolicyForProvider(provider) {
 }
 
 function getModelFallbackForProvider(provider) {
-  const effective = getModelFallbackPolicyForProvider(provider).effective;
-  return { ...effective, isModelPriceable: makeIsModelPriceable(provider) };
+  return getModelFallbackPolicyForProvider(provider).effective;
 }
 
 function getEffectiveModelFallbackForReflect(adapters) {
@@ -147,11 +130,21 @@ function makeModelBodyTransform(
       : cachedModels
   );
   return async (body, req) => {
+    const eligibilityRequest = req || {};
+    pinRequestEligibility(eligibilityRequest);
+    const requestedModel = parseBodyAsObject(body)?.model;
+    // Keep an explicit incompatible model intact so the normal guard order
+    // reports it; alias or family fallback must not silently replace it.
+    if (typeof requestedModel === 'string' && !isModelHarnessEligible(requestedModel, provider, eligibilityRequest)) return null;
+    const eligibleIds = route => resolvableModels()[route]?.filter(id =>
+      isModelEligible(id, route, eligibilityRequest, { inputMode: 'native' }));
+    const eligibleRecords = route => (getRuntimeModels(route) || []).filter(record =>
+      isModelEligible(record.id, route, eligibilityRequest, { inputMode: 'native' }));
     let result = null;
     const scopedAuto = parseScopedAutoRequest(body, req, provider);
     if (scopedAuto) {
       const resolveScopedAuto = () => rewriteScopedAutoRequest(
-        scopedAuto, provider, resolvableModels()[provider], getRuntimeModels(provider), MODEL_POLICY_CONFIG,
+        scopedAuto, provider, eligibleIds(provider), eligibleRecords(provider), MODEL_POLICY_CONFIG,
       );
       result = resolveScopedAuto();
       if (!result) {
@@ -174,8 +167,8 @@ function makeModelBodyTransform(
     ) {
       const getAutoResolution = () => rewriteCopilotAutoResponsesModelInBody(
         body,
-        cachedModels.copilot,
-        getRuntimeModels('copilot'),
+        eligibleIds('copilot'),
+        eligibleRecords('copilot'),
         MODEL_POLICY_CONFIG,
       );
       result = getAutoResolution();
@@ -195,7 +188,7 @@ function makeModelBodyTransform(
       const parsed = parseBodyAsObject(body);
       const selectModel = () => resolveModelSelector(
         parsed?.model, provider, resolvableModels()[provider], getRuntimeModels(provider),
-        MODEL_ALIASES?.models, MODEL_POLICY_CONFIG, providerModelFallback.isModelPriceable,
+        MODEL_ALIASES?.models, MODEL_POLICY_CONFIG, eligibilityRequest,
       );
       let selectedModel;
       try {
@@ -228,18 +221,40 @@ function makeModelBodyTransform(
       }
     }
     if (!result && MODEL_ALIASES) {
-      result = rewriteModelInBody(body, provider, MODEL_ALIASES.models, resolvableModels(), providerModelFallback, MODEL_POLICY_CONFIG);
+      result = rewriteModelInBody(body, provider, MODEL_ALIASES.models, resolvableModels(), providerModelFallback, MODEL_POLICY_CONFIG, eligibilityRequest);
       if (!result || (result.fallback && result.fallback.activated)) {
         await refreshProviderModelsForResolution(provider);
-        result = rewriteModelInBody(body, provider, MODEL_ALIASES.models, resolvableModels(), providerModelFallback, MODEL_POLICY_CONFIG);
+        result = rewriteModelInBody(body, provider, MODEL_ALIASES.models, resolvableModels(), providerModelFallback, MODEL_POLICY_CONFIG, eligibilityRequest);
+      }
+    }
+    if (req && result?.aliasKeys?.some(aliasKey => {
+      const key = Object.keys(MODEL_ALIASES?.models || {})
+        .find(name => name.toLowerCase() === aliasKey.toLowerCase());
+      return key !== undefined && MODEL_ALIASES.models[key]?.fallback === false;
+    })) {
+      req.awfModelRecoveryDisabled = true;
+    }
+    if (req) {
+      const currentRuntimePricing = captureRuntimePricing();
+      if (Object.hasOwn(currentRuntimePricing, provider)) {
+        req.awfRuntimePricing = {
+          ...(req.awfRuntimePricing || {}),
+          [provider]: currentRuntimePricing[provider],
+        };
       }
     }
     if (!result) return null;
+    if (req && result.eligibilityDecision) {
+      req.awfSelectedModelEligibility = Object.freeze({
+        model: result.resolvedModel, provider, decision: result.eligibilityDecision,
+      });
+    }
     // Store ranked candidates on the request object so endpoint-blocked retry
     // logic can fall back to the next candidate without re-resolving.
     if (req && Array.isArray(result.candidates)) {
       req.awfModelCandidates = result.candidates;
     }
+    if (req && result.identity) req.awfModelIdentity = result.identity;
     const originalModel = sanitizeForLog(result.originalModel) || '(none)';
     const resolvedModel = sanitizeForLog(result.resolvedModel);
     if (providerModelFallback.enabled && result.fallback) {

@@ -44,6 +44,7 @@ describe('upstream-http', () => {
       cb({ statusCode: 200, headers: {} });
       return proxyReq;
     });
+
     const handleUpstreamResponse = jest.fn();
     const proxyAgent = { keepAlive: true };
 
@@ -70,6 +71,26 @@ describe('upstream-http', () => {
     expect(proxyReq.write).toHaveBeenCalledWith(Buffer.from('{"ok":true}'));
     expect(proxyReq.end).toHaveBeenCalled();
     expect(handleUpstreamResponse).toHaveBeenCalled();
+  });
+
+  test.each([
+    ['http', 'localhost:11434', 'localhost', 11434],
+    ['https', 'gateway.example.com:8443', 'gateway.example.com', 8443],
+    ['http', 'localhost', 'localhost', 80],
+    ['https', 'gateway.example.com', 'gateway.example.com', 443],
+    ['http', '[::1]:11434', '::1', 11434],
+  ])('dispatches %s://%s with separate hostname and port', (targetScheme, targetHost, hostname, port) => {
+    const request = jest.fn(() => ({ on: jest.fn(), write: jest.fn(), end: jest.fn() }));
+    const proxyAgent = {};
+    const send = createSendUpstreamRequest({
+      http: { request }, https: { request }, proxyAgent,
+      handleUpstreamResponse: jest.fn(), sleep: jest.fn(),
+      otel: {}, handleRequestError: jest.fn(), metrics: {},
+    });
+    send({}, createContext({ targetScheme, targetHost }));
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({
+      hostname, port, path: '/v1/chat/completions', agent: proxyAgent,
+    }), expect.any(Function));
   });
 
   test('rejects exhausted invocation budgets before dispatching another upstream request', () => {
@@ -609,6 +630,7 @@ describe('upstream-http', () => {
     const req = {
       method: 'POST',
       awfModelCandidates: ['a', 'much-longer-model-name'],
+      awfRouting: { onModelFallback: jest.fn() },
     };
 
     sendUpstreamRequest({
@@ -638,6 +660,13 @@ describe('upstream-http', () => {
       body: retryBody,
       headers: expect.objectContaining({ 'content-length': String(retryBody.length) }),
     }));
+    expect(req.awfRouting.onModelFallback).toHaveBeenCalledWith({
+      requested_model: 'a',
+      model: 'much-longer-model-name',
+      provider: 'copilot',
+      from_model: 'a',
+      reason: 'model_endpoint_incompatible',
+    });
   });
 
   test('marks a local unsupported_reasoning_effort rejection on req.awfRouting', () => {

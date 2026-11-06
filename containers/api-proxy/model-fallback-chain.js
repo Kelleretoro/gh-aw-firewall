@@ -29,6 +29,7 @@
  */
 
 const { parseBodyAsObject } = require('./body-utils');
+const { resolveModelIdentity } = require('./model-identity');
 const { stripRedundantProviderPrefix } = require('./model-utils');
 const { getProviderAliases } = require('./provider-pricing-overlays');
 
@@ -149,7 +150,15 @@ function getRequestModel(body, upstreamPath) {
   if (parsed && typeof parsed.model === 'string' && parsed.model.trim()) {
     return { model: parsed.model, location: 'body' };
   }
-  const match = typeof upstreamPath === 'string' ? upstreamPath.match(PATH_MODEL_PATTERN) : null;
+  let pathname;
+  try {
+    pathname = typeof upstreamPath === 'string'
+      ? new URL(upstreamPath, 'http://localhost').pathname
+      : null;
+  } catch {
+    pathname = null;
+  }
+  const match = pathname ? pathname.match(PATH_MODEL_PATTERN) : null;
   if (match) {
     let model = match[2];
     try { model = decodeURIComponent(model); } catch { /* keep raw */ }
@@ -159,8 +168,8 @@ function getRequestModel(body, upstreamPath) {
 }
 
 /**
- * Normalize a configured fallback entry for the receiving provider by stripping
- * a redundant "<provider>/" prefix (e.g. "copilot/gpt-5" on the Copilot port).
+ * Resolve a configured fallback entry to its provider-native canonical wire ID,
+ * preserving parameter suffixes and unknown model spelling.
  *
  * @param {string} model
  * @param {string} provider
@@ -168,11 +177,10 @@ function getRequestModel(body, upstreamPath) {
  */
 function normalizeFallbackModel(model, provider) {
   if (!provider) return model;
-  for (const alias of getProviderAliases(String(provider).toLowerCase())) {
-    const stripped = stripRedundantProviderPrefix(model, alias);
-    if (stripped !== model) return stripped;
-  }
-  return model;
+  const prefix = getProviderAliases(String(provider).toLowerCase())
+    .find(alias => model.toLowerCase().startsWith(`${alias}/`));
+  const nativeModel = prefix ? stripRedundantProviderPrefix(model, prefix) : model;
+  return resolveModelIdentity(nativeModel, provider, { policy: { providerPrefix: false } }).model;
 }
 
 /**
@@ -193,10 +201,14 @@ function resolveFallbackEntry(entry, originProvider) {
       if (prefixProvider === originProvider) {
         return { entry: value, provider: originProvider, model: normalizeFallbackModel(value, originProvider), qualified: true };
       }
-      return { entry: value, provider: prefixProvider, model, qualified: true };
+      return {
+        entry: value, provider: prefixProvider,
+        model: resolveModelIdentity(model, prefixProvider, { policy: { providerPrefix: false } }).model,
+        qualified: true,
+      };
     }
   }
-  return { entry: value, provider: originProvider, model: value, qualified: false };
+  return { entry: value, provider: originProvider, model: normalizeFallbackModel(value, originProvider), qualified: false };
 }
 
 /**

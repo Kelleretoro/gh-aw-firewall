@@ -37,6 +37,10 @@ jest.mock('../external-runtime-backend-resolver', () => {
     resolveExternalRuntimeBackend: jest.fn(actual.resolveExternalRuntimeBackend),
   };
 });
+jest.mock('../services/agent-volumes/credential-hiding', () => ({
+  ...jest.requireActual('../services/agent-volumes/credential-hiding'),
+  buildCredentialHidingOverlays: jest.fn(() => []),
+}));
 
 import { logger } from '../logger';
 import * as dockerManager from '../docker-manager';
@@ -59,12 +63,17 @@ import * as enclaveHostLifecycle from '../enclave/cloud-hypervisor-lifecycle';
 import * as dockerHostLifecycle from '../enclave/docker-lifecycle';
 import * as dynamicDelegation from '../enclave/dynamic-delegation';
 import * as externalRuntimeResolver from '../external-runtime-backend-resolver';
+import * as credentialHiding from '../services/agent-volumes/credential-hiding';
 import { MAIN_ACTION_STUB_CONFIG, setupMainActionTestHarness } from './main-action.test-utils';
 import type { WrapperConfig } from '../types';
 import { CloudHypervisorUnsupportedHostError } from '../cloud-hypervisor/errors';
 import { RoutingFailureExitError } from '../routing/bootstrap';
 import { initializeEnclaveStartupProgress, updateEnclaveStartupProgress } from '../enclave/startup-progress';
 import { normalizeEnclavesConfig } from '../parsers/enclave-parser';
+import {
+  ENCLAVE_GITHUB_EXECUTOR_CAPABILITY_ENV,
+  releaseStaticGithubExecutorCapability,
+} from '../enclave/static-github-handoff';
 import * as enclaveMountPolicy from '../enclave/mount-policy';
 
 const {
@@ -306,6 +315,19 @@ describe('createMainAction', () => {
   });
 
   describe('happy path', () => {
+    it.each([
+      ['copilot -p fixture', true],
+      ['bash -c copilot', false],
+    ])('wires the Docker observation producer only for direct selections: %s', async (agentCommand, supported) => {
+      mockedValidateOptions.validateOptions.mockReturnValueOnce({
+        ...MAIN_ACTION_STUB_CONFIG, agentCommand,
+      });
+      await createMainAction(getOptionValueSource)([agentCommand], {});
+      const dependencies = mockedCliWorkflow.runMainWorkflow.mock.calls[0][1];
+      expect(typeof dependencies.probeHarness).toBe(supported ? 'function' : 'undefined');
+      expect(typeof dependencies.releaseHarness).toBe(supported ? 'function' : 'undefined');
+    });
+
     it('calls workflow steps and exits with 0', async () => {
       mockedCliWorkflow.runMainWorkflow.mockResolvedValue(0);
       const action = createMainAction(getOptionValueSource);
@@ -395,6 +417,61 @@ describe('createMainAction', () => {
       expect(mockedDindBootstrap.runDindBootstrap).not.toHaveBeenCalled();
     });
 
+    it('takes scoped GitHub capability custody before the Docker filesystem probe', async () => {
+      const config = {
+        ...MAIN_ACTION_STUB_CONFIG,
+        enclaves: normalizeEnclavesConfig([{
+          runtime: 'cloud-hypervisor',
+          agent: {
+            model: 'gpt-test',
+            tools: { github: { allowed: ['issue_read'], allowedRepos: ['octo/private'] } },
+          },
+          repos: [{ repo: 'octo/private', sensitivity: 'confidential' }],
+        }]),
+      } as WrapperConfig;
+      const envNames = [
+        ENCLAVE_GITHUB_EXECUTOR_CAPABILITY_ENV,
+        'AWF_ENCLAVE_GITHUB_MCP_AGENT_ID',
+        'AWF_ENCLAVE_MCP_GATEWAY_IDENTITY',
+      ];
+      const previousEnv = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
+      const agentId = 'a'.repeat(40);
+      const now = Date.now();
+      Object.assign(process.env, {
+        AWF_ENCLAVE_MCP_GATEWAY_IDENTITY: 'compiler-run-123',
+        AWF_ENCLAVE_GITHUB_MCP_AGENT_ID: agentId,
+        [ENCLAVE_GITHUB_EXECUTOR_CAPABILITY_ENV]: JSON.stringify({
+          version: 1,
+          gatewayIdentity: 'compiler-run-123',
+          executor: 'agent',
+          agentId,
+          bearer: 'scoped-executor-capability-for-cli-ordering-test',
+          issuedAt: now - 1000,
+          expiresAt: now + 300_000,
+          allowedTools: ['issue_read'],
+          allowedRepos: ['octo/private'],
+          minIntegrity: null,
+        }),
+      });
+      mockedValidateOptions.validateOptions.mockReturnValueOnce(config);
+      mockedDindProbe.probeSplitFilesystem.mockImplementationOnce(async () => {
+        expect(process.env[ENCLAVE_GITHUB_EXECUTOR_CAPABILITY_ENV]).toBeUndefined();
+        expect(process.env.AWF_ENCLAVE_GITHUB_MCP_AGENT_ID).toBeUndefined();
+        return { prefix: undefined, splitDetected: false, inconclusive: false };
+      });
+
+      try {
+        await createMainAction(getOptionValueSource)(['echo hi'], {});
+      } finally {
+        releaseStaticGithubExecutorCapability(config);
+        for (const [name, value] of Object.entries(previousEnv)) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
+      expect(mockedDindProbe.probeSplitFilesystem).toHaveBeenCalledTimes(1);
+    });
+
     it('auto-applies detected DinD prefix and logs info', async () => {
       mockedDindProbe.probeSplitFilesystem.mockResolvedValue({
         prefix: '/host',
@@ -408,6 +485,28 @@ describe('createMainAction', () => {
       expect(mockedLogger.info).toHaveBeenCalledWith(
         expect.stringContaining('Auto-applied --docker-host-path-prefix /host')
       );
+    });
+
+    it('publishes runner paths after auto-detecting a daemon-only DinD prefix', async () => {
+      const source = '/home/runner/_work/_temp/gh-aw/sandbox/agent/logs';
+      const target = '/tmp/gh-aw/sandbox/agent/logs';
+      mockedValidateOptions.validateOptions.mockReturnValue({
+        ...MAIN_ACTION_STUB_CONFIG,
+        runnerTopology: 'arc-dind',
+        volumeMounts: [`${source}:${target}:rw`],
+      });
+      mockedDindProbe.probeSplitFilesystem.mockResolvedValue({
+        prefix: '/tmp/gh-aw', splitDetected: true, inconclusive: false,
+      });
+
+      await createMainAction(getOptionValueSource)(['echo hi'], {});
+
+      const calls = jest.mocked(publishEarlyResolvedConfig).mock.calls;
+      const published = JSON.parse(calls[calls.length - 1][0]);
+      expect(published.dockerHostPathPrefix).toBe('/tmp/gh-aw');
+      expect(published.runnerMountPaths).toEqual([
+        { sandboxPath: target, runnerPath: source },
+      ]);
     });
 
     it('logs warning when split filesystem is detected without a known prefix', async () => {
@@ -1429,6 +1528,20 @@ describe('createMainAction', () => {
       });
     });
 
+    it('omits host-only broker and bootstrap env configuration from resolved artifacts', () => {
+      const redacted = testHelpers.redactConfigForLogging({
+        ...MAIN_ACTION_STUB_CONFIG,
+        additionalEnv: {
+          AWF_COPILOT_TOKEN_BROKER: 'true',
+          GH_AW_TOKEN_BROKER_URL: 'https://broker.example.com/mint',
+          ACTIONS_ID_TOKEN_REQUEST_URL: 'https://pipelines.actions.githubusercontent.com/idtoken',
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'bootstrap-only',
+          KEEP: 'public-value',
+        },
+      } as import('../types').WrapperConfig);
+      expect(redacted.additionalEnv).toEqual({ KEEP: '[REDACTED]' });
+    });
+
     it('redactConfigForLogging preserves null additionalEnv', () => {
       const redacted = testHelpers.redactConfigForLogging({
         ...MAIN_ACTION_STUB_CONFIG,
@@ -1445,6 +1558,96 @@ describe('createMainAction', () => {
       } as unknown as import('../types').WrapperConfig);
 
       expect(redacted.additionalEnv).toBe('raw-env-string');
+    });
+
+    it.each(['/host', '/tmp/gh-aw', '/tmp'])(
+      'publishes ARC/DinD runner mount paths with prefix %s without changing config',
+      (dockerHostPathPrefix) => {
+        const source = '/home/runner/_work/_temp/gh-aw/sandbox/agent/logs';
+        const target = '/tmp/gh-aw/sandbox/agent/logs';
+        const config = {
+          ...MAIN_ACTION_STUB_CONFIG,
+          runnerTopology: 'arc-dind' as const,
+          dockerHostPathPrefix,
+          volumeMounts: [`${source}:${target}:rw`],
+        };
+        testHelpers.persistConfigAuditArtifact(config, { agentCommand: 'redacted' });
+        const calls = jest.mocked(publishEarlyResolvedConfig).mock.calls;
+        expect(JSON.parse(calls[calls.length - 1][0])).toEqual({
+          agentCommand: 'redacted',
+          runnerMountPaths: [{
+            sandboxPath: target,
+            runnerPath: dockerHostPathPrefix === '/tmp' ? `/tmp${source}` : source,
+          }],
+        });
+        expect(config.volumeMounts).toEqual([`${source}:${target}:rw`]);
+        expect(config).not.toHaveProperty('runnerMountPaths');
+      },
+    );
+
+    it('does not publish explicit mounts removed by the ARC sysroot filter', () => {
+      const source = '/home/runner/_work/_temp/gh-aw/sandbox/agent/logs';
+      const target = '/tmp/gh-aw/sandbox/agent/logs';
+      const config = {
+        ...MAIN_ACTION_STUB_CONFIG,
+        runnerTopology: 'arc-dind' as const,
+        dockerHostPathPrefix: '/host',
+        volumeMounts: [
+          '/usr:/opt:rw',
+          `${MAIN_ACTION_STUB_CONFIG.workDir}/logs:/tmp/private-logs:rw`,
+          `${source}:${target}:rw`,
+        ],
+      };
+      testHelpers.persistConfigAuditArtifact(config, {});
+      const calls = jest.mocked(publishEarlyResolvedConfig).mock.calls;
+      expect(JSON.parse(calls[calls.length - 1][0]).runnerMountPaths).toEqual([
+        { sandboxPath: target, runnerPath: source },
+      ]);
+    });
+
+    it('does not publish a custom bind hidden by a credential overlay', () => {
+      const source = '/home/runner/_work/_temp/config.yml';
+      const target = '/tmp/agent-logs/config.yml';
+      const config = {
+        ...MAIN_ACTION_STUB_CONFIG,
+        runnerTopology: 'arc-dind' as const,
+        dockerHostPathPrefix: '/host',
+        volumeMounts: [`${source}:${target}:rw`],
+      };
+      const overlays = jest.spyOn(credentialHiding, 'buildCredentialHidingOverlays')
+        .mockReturnValue([`/dev/null:/host${target}:ro`]);
+
+      try {
+        testHelpers.persistConfigAuditArtifact(config, {});
+      } finally {
+        overlays.mockRestore();
+      }
+
+      const calls = jest.mocked(publishEarlyResolvedConfig).mock.calls;
+      expect(JSON.parse(calls[calls.length - 1][0]).runnerMountPaths).toEqual([]);
+    });
+
+    it.each(['/tmp/root:/host:rw', '/tmp/root:/host/:rw'])(
+      'does not publish a root bind replaced by the ARC sysroot (%s)',
+      (rootMount) => {
+        const config = {
+          ...MAIN_ACTION_STUB_CONFIG,
+          runnerTopology: 'arc-dind' as const,
+          dockerHostPathPrefix: '/host',
+          volumeMounts: [rootMount],
+        };
+
+        testHelpers.persistConfigAuditArtifact(config, {});
+
+        const calls = jest.mocked(publishEarlyResolvedConfig).mock.calls;
+        expect(JSON.parse(calls[calls.length - 1][0]).runnerMountPaths).toEqual([]);
+      },
+    );
+
+    it('does not publish compose mount mappings for other topologies', () => {
+      testHelpers.persistConfigAuditArtifact(MAIN_ACTION_STUB_CONFIG, { agentCommand: 'redacted' });
+      const calls = jest.mocked(publishEarlyResolvedConfig).mock.calls;
+      expect(JSON.parse(calls[calls.length - 1][0])).toEqual({ agentCommand: 'redacted' });
     });
 
     it('persistConfigAuditArtifact warns when publishing the artifact fails', () => {

@@ -21,9 +21,9 @@ function countOccurrences(content: string, value: string): number {
 
 describe('experimental Cloud Hypervisor enclave smoke workflow', () => {
   const compilerVersion =
-    'v0.93.4';
+    'v1.0.1';
   const setupAction =
-    'github/gh-aw-actions/setup@40fb427c047bb9f77324054adeb574e04c9481aa';
+    'github/gh-aw-actions/setup@221ba4f4319de6b8e809d1a15528b3ae6a818aa5';
   const source = fs.readFileSync(
     path.join(workflowsDir, 'smoke-enclave-cloud-hypervisor.md'), 'utf8'
   );
@@ -596,7 +596,7 @@ describe('experimental Cloud Hypervisor enclave smoke workflow', () => {
     expect(countOccurrences(lock, '- name: Start MCP Gateway')).toBe(1);
     expect(lock).toContain('ghcr.io/github/gh-aw-mcpg:');
     expect(lock).toContain(
-      'ghcr.io/github/gh-aw-mcpg:v0.4.37@sha256:9c7f242f6dec2d7d7b55d4c9e07872d59b85377c6cb3de46c915a5d1ffb91442'
+      'ghcr.io/github/gh-aw-mcpg:v0.5.0@sha256:d3544a4222e7efeeeb38669d8a1af0c72691c55b8f6506b15aa5920f7f31b7bc'
     );
     expect(lock).toContain('"awf-enclave": {\n                "required": false,');
     expect(lock).toContain('GH_AW_MCP_DEFERRED_SERVERS="awf-enclave"');
@@ -624,7 +624,7 @@ describe('experimental Cloud Hypervisor enclave smoke workflow', () => {
     expect(source).toContain('consumes the host-only `AWF_RESOLVED_CONFIG` path');
     expect(source).toContain('successful privileged cleanup');
     expect(source).toContain('Do not copy raw\nresolved JSON into normal artifact paths');
-    expect(source).toContain('official gh-aw v0.93.4 release');
+    expect(source).toContain('official gh-aw v1.0.1 release');
     expect(source).toContain(compilerVersion);
     expect(steps.some(step =>
       step.uses === setupAction
@@ -873,7 +873,7 @@ pathlib.Path("/query/out").write_text(json.dumps(result), encoding="utf-8")`);
   it('enables debugging on the real AWF command and collects only after the agent, including failure', () => {
     const compiled = yaml.load(lock) as {
       jobs: Record<string, {
-        steps: Array<{ name: string; id?: string; if?: string; run?: string;
+        steps: Array<{ name: string; id?: string; if?: string; run?: string; 'continue-on-error'?: boolean;
           env?: Record<string, string>; uses?: string; with?: Record<string, unknown> }>;
       }>;
     };
@@ -887,23 +887,27 @@ pathlib.Path("/query/out").write_text(json.dumps(result), encoding="utf-8")`);
     expect(collect).toBeGreaterThan(execute);
     expect(upload).toBeGreaterThan(collect);
     expect(steps[execute].run).toContain(
-      'sudo --preserve-env awf --cloud-hypervisor-enclave-debug-public --config'
+      '/usr/local/bin/awf --cloud-hypervisor-enclave-debug-public --config'
     );
     expect(countOccurrences(steps[execute].run!, '--cloud-hypervisor-enclave-debug-public')).toBe(1);
     expect(steps[execute].env?.DEBUG_RUN_KEY).toBeUndefined();
     expect(steps[prepare].run).toContain('sudo install -m 0600 -o root -g root');
+    expect(steps[prepare].run).toContain('prepare cloud-hypervisor "$DEBUG_RUN_KEY" "$(id -u)" "$(id -g)"');
     expect(steps[collect].if).toBe('always()');
-    expect(steps[collect].run).toContain('sudo node /var/lib/awf-enclave-smoke-export/collector.cjs collect');
-    expect(steps[upload].if).toBe("always() && steps.collect-enclave-debug.outcome == 'success'");
+    expect(steps[collect].run).toContain(
+      'sudo node /var/lib/awf-enclave-smoke-export/collector.cjs collect cloud-hypervisor "$DEBUG_RUN_KEY" "$(id -u)" "$(id -g)"'
+    );
+    expect(steps[upload].if).toBe('always()');
     expect(steps[upload].with?.['retention-days']).toBe(1);
     expect(steps[upload].with?.path).toBe(
       '/var/lib/awf-enclave-smoke-export/${{ github.run_id }}-${{ github.run_attempt }}/upload/'
     );
-    expect(steps[upload].with?.['if-no-files-found']).toBe('error');
+    expect(steps[upload].with?.['if-no-files-found']).toBe('ignore');
+    expect(steps[upload]['continue-on-error']).toBeUndefined();
     expect(source).toContain('intentionally disclosed to Actions artifact readers');
     expect(source.split('---').slice(2).join('---')).not.toContain('/var/lib/');
     expect(() => applyGeneralWorkflowPatches(
-      lock.replace('sudo --preserve-env awf --cloud-hypervisor-enclave-debug-public --config', 'missing-awf'),
+      lock.replace('/usr/local/bin/awf --cloud-hypervisor-enclave-debug-public --config', 'missing-awf'),
       workflowPath,
     )).toThrow(/exactly one trusted host AWF/);
     expect(() => applyGeneralWorkflowPatches(
@@ -925,6 +929,16 @@ describe('smoke enclave build workflow', () => {
   const source = fs.readFileSync(sourcePath, 'utf8');
   const lock = fs.readFileSync(lockPath, 'utf8');
 
+  it('pins the agent runner to Ubuntu 24.04 for sudo environment preservation', () => {
+    const frontmatter = yaml.load(source.split('---')[1]) as { 'runs-on': string };
+    const compiled = yaml.load(lock) as {
+      jobs: { agent: { 'runs-on': string } };
+    };
+
+    expect(frontmatter['runs-on']).toBe('ubuntu-24.04');
+    expect(compiled.jobs.agent['runs-on']).toBe('ubuntu-24.04');
+  });
+
   it('installs the authored CLI version above the generated feature minimum with a verified checksum', () => {
     const frontmatter = yaml.load(source.split('---')[1]) as {
       engine: { version: string; 'checksums-sha256': string };
@@ -943,7 +957,7 @@ describe('smoke enclave build workflow', () => {
       version: '1.0.98',
       'checksums-sha256': '372f0c8d3d50076455cd19ef080dc59dc2a32401d8b2d4f77ce190c8ab13bc59',
     });
-    expect(lock).toContain('github/gh-aw-actions/setup@40fb427c047bb9f77324054adeb574e04c9481aa');
+    expect(lock).toContain('github/gh-aw-actions/setup@221ba4f4319de6b8e809d1a15528b3ae6a818aa5');
     expect(compiled.jobs.agent.env.GH_AW_ENGINE_VERSION).toBe(frontmatter.engine.version);
     expect(minimum).toMatch(/^\d+\.\d+\.\d+$/);
     expect('1.0.34'.localeCompare(minimum!, 'en', { numeric: true })).toBeLessThan(0);
@@ -978,7 +992,7 @@ describe('smoke enclave build workflow', () => {
   });
 
   it('uses the compatible gateway and local AWF build', () => {
-    expect(lock).toContain('ghcr.io/github/gh-aw-mcpg:v0.4.37');
+    expect(lock).toContain('ghcr.io/github/gh-aw-mcpg:v0.5.0');
     expect(lock).toContain('"awf-enclave": {\n                "required": false,');
     expect(lock).toContain('Install local AWF binary');
     expect(lock).toContain('--build-local');
@@ -1148,6 +1162,95 @@ describe('smoke enclave issues workflow', () => {
     );
   });
 
+  it('preserves AWF credentials and sudo secure_path with sudo-rs without exposing token arguments', () => {
+    const frontmatter = yaml.load(source.split('---')[1]) as {
+      sandbox: { agent: { command: string } };
+    };
+    const command = frontmatter.sandbox.agent.command;
+    expect(command).toBe(
+      'sudo --preserve-env=AWF_REFLECT_ENABLED,COPILOT_AGENT_RUNNER_TYPE,COPILOT_DUMMY_BYOK,COPILOT_GITHUB_TOKEN,COPILOT_MODEL,GH_AW_LLM_PROVIDER,GH_AW_MAX_AI_CREDITS,GH_AW_MAX_TURNS,GH_AW_PHASE,GH_AW_PROMPT,GH_AW_SAFE_OUTPUTS,GH_AW_TIMEOUT_MINUTES,GH_AW_VERSION,GITHUB_API_URL,GITHUB_AW,GITHUB_COPILOT_INTEGRATION_ID,GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS,GITHUB_HEAD_REF,GITHUB_REF_NAME,GITHUB_SERVER_URL,GITHUB_STEP_SUMMARY,GITHUB_WORKSPACE,GIT_AUTHOR_EMAIL,GIT_AUTHOR_NAME,GIT_COMMITTER_EMAIL,GIT_COMMITTER_NAME,MCP_GATEWAY_API_KEY,GH_TOKEN,RUNNER_TEMP,RUNNER_TOOL_CACHE,S2STOKENS,TRACEPARENT,AWF_ENCLAVE_MCP_CAPABILITY,AWF_ENCLAVE_MCP_GATEWAY_CONTAINER,AWF_ENCLAVE_MCP_GATEWAY_ENDPOINT,AWF_ENCLAVE_MCP_GATEWAY_IDENTITY,AWF_ENCLAVE_MCP_READINESS_TIMEOUT_MS,AWF_ENCLAVE_GITHUB_MCP_AGENT_ID,GH_AW_AWF_EXECUTION_COMPONENT,GH_AW_AWF_EXECUTION_EVIDENCE_FILE,GH_AW_AWF_ENGINE_NAME,GH_AW_AWF_HARNESS_MARKER,GH_AW_AWF_LOG_FILE,GH_AW_AWF_ATTEMPT_LOG_NAME,GH_AW_NODE_BIN /usr/local/bin/awf'
+    );
+    expect(lock).toContain(`${command} --config`);
+    expect(lock).toContain('COPILOT_GITHUB_TOKEN: ${{ github.token }}');
+    expect(lock).toContain('--exclude-env COPILOT_GITHUB_TOKEN');
+    const handoff = {
+      AWF_ENCLAVE_MCP_GATEWAY_CONTAINER: 'awmg-mcpg',
+      AWF_ENCLAVE_MCP_GATEWAY_ENDPOINT: 'http://localhost:8080/mcp/awf-enclave',
+      AWF_ENCLAVE_MCP_GATEWAY_IDENTITY: 'gh-aw-test-run',
+      AWF_ENCLAVE_MCP_READINESS_TIMEOUT_MS: '120000',
+      AWF_ENCLAVE_GITHUB_MCP_AGENT_ID: 'synthetic-enclave-agent-identity',
+    };
+    for (const name of Object.keys(handoff)) {
+      expect(lock).toContain(`--exclude-env ${name}`);
+      expect(lock).toContain(`printf '%s=%s\\n' ${name} "$${name}"`);
+    }
+
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'enclave-sudo-env-'));
+    try {
+      const awf = path.join(directory, 'awf');
+      const sudoArgs = path.join(directory, 'sudo-args');
+      const securePath = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+      fs.writeFileSync(awf, `#!/bin/bash
+printf '%s\\0' "$COPILOT_GITHUB_TOKEN" "$MCP_GATEWAY_API_KEY" "$AWF_ENCLAVE_MCP_CAPABILITY" "$RUNNER_TEMP" "$PATH" "$@"
+printf '%s\\0' ${Object.keys(handoff).map(name => `"$${name}"`).join(' ')}
+`, { mode: 0o700 });
+      const script = `sudo() {
+  printf '%s\\0' "$@" > ${JSON.stringify(sudoArgs)}
+  local names=() preserved=() name
+  case "$1" in
+    --preserve-env=*) IFS=, read -r -a names <<< "\${1#*=}"; shift ;;
+    --preserve-env|-E) shift ;;
+  esac
+  for name in "\${names[@]}"; do
+    preserved+=("$name=\${!name}")
+  done
+  # Model sudoers secure_path overriding the preserved PATH.
+  preserved+=("PATH=/usr/sbin:/usr/bin:/sbin:/bin")
+  /usr/bin/env -i "\${preserved[@]}" PATH=${JSON.stringify(securePath)} "$@"
+}
+${command.replace('/usr/local/bin/awf', JSON.stringify(awf))} --config /tmp/awf-config.json`;
+      const env = {
+        PATH: `${directory}:/usr/bin:/bin`,
+        COPILOT_GITHUB_TOKEN: 'synthetic-copilot-credential',
+        MCP_GATEWAY_API_KEY: 'synthetic-gateway-credential',
+        AWF_ENCLAVE_MCP_CAPABILITY: 'synthetic-enclave-capability',
+        RUNNER_TEMP: directory,
+        ...handoff,
+      };
+      const result = execFileSync('/bin/bash', ['--noprofile', '--norc', '-c', script],
+        { env, encoding: 'utf8', timeout: 5000 }).split('\0').slice(0, -1);
+      expect(result).toEqual([env.COPILOT_GITHUB_TOKEN, env.MCP_GATEWAY_API_KEY,
+        env.AWF_ENCLAVE_MCP_CAPABILITY, env.RUNNER_TEMP, securePath,
+        '--config', '/tmp/awf-config.json', ...Object.values(handoff)]);
+      const args = fs.readFileSync(sudoArgs, 'utf8');
+      for (const name of Object.keys(env).filter(name => name !== 'PATH')) {
+        expect(args.split('\0')[0].slice('--preserve-env='.length).split(',')).toContain(name);
+      }
+      for (const credential of [env.COPILOT_GITHUB_TOKEN, env.MCP_GATEWAY_API_KEY,
+        env.AWF_ENCLAVE_MCP_CAPABILITY, env.AWF_ENCLAVE_GITHUB_MCP_AGENT_ID]) {
+        expect(args).not.toContain(credential);
+      }
+      const insecureScript = script.replace(
+        command.replace('/usr/local/bin/awf', JSON.stringify(awf)),
+        command.replace('/usr/local/bin/awf', `/usr/bin/env PATH="$PATH" ${JSON.stringify(awf)}`)
+      );
+      const insecureResult = execFileSync('/bin/bash', ['--noprofile', '--norc', '-c',
+        insecureScript], { env, encoding: 'utf8', timeout: 5000 }).split('\0');
+      expect(insecureResult[4]).toBe(env.PATH);
+      expect(insecureResult[4]).not.toBe(securePath);
+      const oldScript = script.replace(
+        command.replace('/usr/local/bin/awf', JSON.stringify(awf)),
+        `sudo --preserve-env /usr/bin/env PATH="$PATH" ${JSON.stringify(awf)}`
+      );
+      const oldResult = execFileSync('/bin/bash', ['--noprofile', '--norc', '-c',
+        oldScript], { env, encoding: 'utf8', timeout: 5000 }).split('\0');
+      expect(oldResult.slice(0, 4)).toEqual(['', '', '', '']);
+      expect(oldResult.slice(7, 12)).toEqual(['', '', '', '', '']);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('accepts the emitted stdio image under the pinned gateway container schema', () => {
     const frontmatter = yaml.load(source.split('---')[1]) as {
       sandbox: { mcp?: { version?: string } };
@@ -1272,6 +1375,16 @@ describe('smoke enclave dynamic issues workflow', () => {
   const source = fs.readFileSync(dynamicSourcePath, 'utf8');
   const lock = fs.readFileSync(dynamicLockPath, 'utf8');
 
+  it('pins the agent job to Ubuntu 24.04 for credential-preserving sudo', () => {
+    const frontmatter = yaml.load(source.split('---')[1]) as { 'runs-on': string };
+    const compiled = yaml.load(lock) as {
+      jobs: { agent: { 'runs-on': string } };
+    };
+
+    expect(frontmatter['runs-on']).toBe('ubuntu-24.04');
+    expect(compiled.jobs.agent['runs-on']).toBe('ubuntu-24.04');
+  });
+
   it('passes the pinned Copilot release checksum to the installer', () => {
     const frontmatter = yaml.load(source.split('---')[1]) as {
       engine: { version: string; 'checksums-sha256': string };
@@ -1311,8 +1424,8 @@ describe('smoke enclave dynamic issues workflow', () => {
     expect(lock).not.toContain('\\"repos\\":[{\\"repo\\":\\"github/gh-aw\\"');
   });
 
-  it('uses mcpg v0.4.19 with the delegation controller', () => {
-    expect(lock).toContain('ghcr.io/github/gh-aw-mcpg:v0.4.19');
+  it('uses mcpg v0.4.36 with the delegation controller', () => {
+    expect(lock).toContain('ghcr.io/github/gh-aw-mcpg:v0.4.36');
     expect(lock).toContain('AWF_ENCLAVE_GITHUB_DELEGATION_CONTROL_CAPABILITY=$(openssl rand -hex 32');
     expect(lock).toContain('AWF_ENCLAVE_GITHUB_DELEGATION_CONTROL_ENDPOINT="http://127.0.0.1:8090/internal/awf-enclave-mcp-control/github-repository-delegation-v1"');
     expect(lock).toContain(
@@ -1320,6 +1433,46 @@ describe('smoke enclave dynamic issues workflow', () => {
     );
     expect(lock).toContain('Install local AWF binary');
     expect(lock).toContain('--build-local');
+  });
+
+  it('accepts digest-pinned stdio images under the declared gateway schema', () => {
+    const frontmatter = yaml.load(source.split('---')[1]) as {
+      sandbox: { mcp: { version: string } };
+    };
+    const compiled = yaml.load(lock) as {
+      jobs: { agent: { steps: Array<{ name: string; run?: string }> } };
+    };
+    const gateway = compiled.jobs.agent.steps.find(step =>
+      step.name === 'Start MCP Gateway')?.run;
+    const image = 'ghcr.io/github/gh-aw-mcpg:v0.4.36';
+    const digest = 'sha256:b4d2856018959c798b3e3f81ae4ab5b275e06354e123e1f7971de931f2f450f2';
+    const pinned = `${image}@${digest}`;
+    expect(frontmatter.sandbox.mcp.version).toBe('v0.4.36');
+    expect(gateway).toContain(pinned);
+    expect(compiled.jobs.agent.steps.find(step =>
+      step.name === 'Download container images')?.run).toContain(pinned);
+    const manifest = JSON.parse(lock.match(/^# gh-aw-manifest: (.+)$/m)![1]) as {
+      containers: Array<{ image: string; digest: string; pinned_image: string }>;
+    };
+    expect(manifest.containers.filter(container => container.image === image))
+      .toEqual([{ image, digest, pinned_image: pinned }]);
+
+    // Container schema from github/gh-aw-mcpg v0.4.36 (github/gh-aw-mcpg#15212).
+    const compatible = new Ajv().compile({
+      type: 'string',
+      minLength: 1,
+      pattern: '^[a-zA-Z0-9][a-zA-Z0-9./_-]*(:([a-zA-Z0-9._-]+|latest))?(@sha256:[a-fA-F0-9]{64})?$',
+    });
+    const images = Array.from(gateway?.matchAll(/"container": "([^"]+)"/g) ?? [],
+      match => match[1]);
+    expect(images.some(value => value.startsWith('ghcr.io/github/gh-aw-node@sha256:')))
+      .toBe(true);
+    for (const value of images) {
+      expect(compatible(value)).toBe(true);
+      if (value.includes('@sha256:')) {
+        expect(compatible(value.replace('@sha256:', '@sha512:'))).toBe(false);
+      }
+    }
   });
 
   it('keeps the delegation envelope live for the job while bounding identity TTL', () => {

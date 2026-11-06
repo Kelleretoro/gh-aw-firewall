@@ -2,7 +2,7 @@
 
 const { randomUUID } = require('crypto');
 const { logRequest } = require('./logging');
-const { shouldStripHeader, sanitizeAcceptEncoding } = require('./proxy-utils');
+const { shouldStripHeader, sanitizeAcceptEncoding, getTargetHostname } = require('./proxy-utils');
 const { maybeStripLearnedHeaderValues } = require('./deprecated-header-tracker');
 const { recordCopilotInjectedHeaders } = require('./copilot-auth-diagnostics');
 
@@ -82,11 +82,13 @@ function ensureHeader(headers, name, value) {
 }
 
 function isCopilotHost(targetHost) {
+  targetHost = getTargetHostname(targetHost);
   return targetHost === 'githubcopilot.com' ||
     (typeof targetHost === 'string' && targetHost.endsWith('.githubcopilot.com'));
 }
 
 function isCopilotIntegrationHost(targetHost) {
+  targetHost = getTargetHostname(targetHost);
   return isCopilotHost(targetHost)
     || (typeof targetHost === 'string' && /^copilot-api\.[^.]+\.ghe\.com$/.test(targetHost));
 }
@@ -173,7 +175,8 @@ function buildRequestHeaders(body, inboundBytes, req, { injectHeaders, provider,
   const injectedKey = Object.entries(injectHeaders).find(([k]) =>
     ['x-api-key', 'authorization', 'x-goog-api-key'].includes(k.toLowerCase())
   )?.[1];
-  if (injectedKey) {
+  const renewableAuth = injectHeaders[Symbol.for('awf.renewableAuth')] === true;
+  if (injectedKey && !renewableAuth) {
     const keyPreview = injectedKey.length > 8
       ? `${injectedKey.substring(0, 8)}...${injectedKey.substring(injectedKey.length - 4)}`
       : '(short)';
@@ -184,7 +187,7 @@ function buildRequestHeaders(body, inboundBytes, req, { injectHeaders, provider,
     });
   }
 
-  if (provider === 'copilot') recordCopilotInjectedHeaders(req, injectHeaders);
+  if (provider === 'copilot' && !renewableAuth) recordCopilotInjectedHeaders(req, injectHeaders);
   return headers;
 }
 

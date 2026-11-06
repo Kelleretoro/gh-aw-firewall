@@ -304,6 +304,27 @@ The following OTEL variables often carry bearer tokens or other credentials and 
 | `OTEL_EXPORTER_OTLP_METRICS_HEADERS` | Per-signal auth headers |
 | `OTEL_EXPORTER_OTLP_LOGS_HEADERS` | Per-signal auth headers |
 
+### Security: compose snapshots
+
+Audit and diagnostic compose snapshots hide environment values **by default**, using
+`[REDACTED]`. One shared policy covers both snapshots, including `GH_AW_OTLP_ENDPOINTS`,
+OTLP headers, complete endpoint URLs, and secrets in ordinary or newly introduced variables.
+
+A small allowlist preserves only `true`/`false` for `AWF_CHROOT_ENABLED`, `AWF_DOH_ENABLED`,
+`AWF_SSL_BUMP_ENABLED`, and `OTEL_SDK_DISABLED`, and `grpc`/`http/protobuf`/`http/json` for
+global and per-signal `OTEL_EXPORTER_OTLP_*PROTOCOL` settings. Unexpected values under
+these names are still hidden. Free-form identifiers, addresses, and paths are not exempt.
+
+Variable names, service definitions, images, mounts, and networks remain available for
+diagnosis, but other environment values previously visible in snapshots are no longer available.
+This is snapshot redaction, not a change to environment forwarding or network policy.
+It does not sanitize arbitrary credentials embedded outside the environment section.
+
+The runtime compose file retains the original values so container startup and telemetry
+export work unchanged; snapshots are not suitable for replay. Do not upload the runtime
+file. Upgrading does not sanitize previously uploaded artifacts. If collector credentials
+or job secrets were exposed, revoke or rotate them and remove the affected artifacts.
+
 ### Network requirements
 
 - **OTLP/HTTP (`http/protobuf`, default):** Traffic goes through the Squid proxy on ports 80/443. The collector domain is [auto-allowed](#automatic-otlp-endpoint-allowlisting) from `OTEL_EXPORTER_OTLP_ENDPOINT` / `_TRACES_ENDPOINT` / `_METRICS_ENDPOINT` / `_LOGS_ENDPOINT`, so no `--allow-domains` flag is normally required:
@@ -472,6 +493,59 @@ the consumer looks for it. See
 [docs/arc-dind.md](arc-dind.md#staging-additional-cli-tools-not-just-the-invoking-engine-binary)
 for the full staging + rw-mount pattern, using a threat-detection tool as a
 worked example.
+
+### `--mount` does not grant engine file scope
+
+Mount visibility, host permissions, and engine file scope are separate checks.
+Neither `:ro` nor `:rw` grants an engine permission to read a mounted directory.
+The workload user still needs filesystem read/traverse permission, and engines
+such as Copilot require their own scope grant (for example, `--add-dir`).
+AWF passes the command through unchanged; it does not add engine scope flags.
+
+When explicit mounts are supplied, AWF emits one advisory about this distinction.
+The advisory is not a scope check: AWF cannot infer a wrapper's subprocess policy
+from shell command text, and emits it even when scope has already been granted.
+It does not change the command, permissions, or exit status.
+
+For example, mount staged inputs read-only and grant Copilot the
+**sandbox-visible destination**, not a different host source path:
+
+```bash
+# Stage the required input files in this directory before invoking AWF.
+mkdir -p "${RUNNER_TEMP}/gh-aw/threat-detection"
+awf --mount "${RUNNER_TEMP}/gh-aw/threat-detection:/tmp/gh-aw/threat-detection:ro" \
+    --input-dir /tmp/gh-aw/threat-detection \
+    --allow-domains github.com,api.githubcopilot.com \
+    -- copilot --add-dir /tmp/gh-aw/threat-detection \
+       --prompt "Analyze the staged inputs in /tmp/gh-aw/threat-detection"
+```
+
+This illustrates a direct Copilot invocation, not the `threat-detect` interface.
+When a wrapper launches the engine, it must grant scope to that subprocess;
+adding a mount or granting scope to a separate agent invocation is insufficient.
+
+AWF validates mount syntax and host source existence. Opt in to an input-specific
+preflight with repeatable `--input-dir <sandbox-visible-path>` flags. Before the
+command runs, the sandbox workload user must be able to traverse and list each
+declared directory and read every file in its tree. Missing or empty directories,
+unreadable files, broken/cyclic symlinks, and non-regular input entries fail with
+exit code 1 and an `AWF input preflight failed` error. Symlinks are followed;
+file contents are discarded, not logged. The flag does not add mounts, change
+permissions, grant engine scope, or validate a detector verdict. Without it,
+mount behavior is unchanged. This is a CLI option, not an AWF config-file field.
+A host-side check (possibly running as root) cannot prove access under the
+sandbox user's identity or the engine's file policy.
+Inside the sandbox, `test -r` on each required file and `test -x` on its parent
+directories are preliminary checks only: the detector must successfully open
+and consume every required input through its actual engine/tool path.
+Missing or unreadable inputs, engine permission denials, or a missing/invalid
+verdict must fail detection closed, never produce a clean verdict.
+An empty directory or a zero engine exit status is not evidence of analysis.
+
+The detector scope grant and fail-closed verdict handling belong to `gh-aw` /
+`threat-detect` ([github/gh-aw#72897](https://github.com/github/gh-aw/issues/72897)),
+not AWF's mount layer. See also the
+[ARC/DinD ownership and verification guidance](arc-dind.md#agent-logs-threat-detection-and-safe-output-ownership).
 
 ### Security: procfs and credential isolation
 

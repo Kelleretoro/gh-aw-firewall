@@ -362,6 +362,28 @@ Pricing is provider- and channel-scoped. A tariff contains:
 Maintained decimal prices are stored without binary floating-point loss and
 converted to an exact internal unit for accounting.
 
+The active Phase 5 arithmetic implementation uses bounded nonnegative rational
+values through source normalization, unit/batch conversion, shared tariff
+selection, token charges and per-model/process accumulation. Public rate views
+remain Numbers with private exact companions; request/connection captures retain
+both without serializing internal values. Maintained generated rates retain their
+source decimal strings. Legacy numeric inputs preserve their available
+`String(value)` representation only, never recovered source precision.
+
+Six-place credit rounding is output-only, nearest with exact ties upward;
+percent-used remains ceiling-clamped at two places. Budget/hard-cap and steering
+comparisons use unrounded totals and exact limits, including sub-output-unit
+charges. Thus `0.9999996` credits no longer exhausts a one-credit budget merely
+because it displays as one. Existing logs, reflection, telemetry and environment
+fields remain compatible output projections, not restartable exact ledgers.
+Unsupported decimals, unsafe token counts, arithmetic bounds and nonrepresentable
+outputs fail explicitly through sanitized pricing errors and subsequent dispatch
+blocking, not approximation or lower-authority fallback. See
+[exact-decimal accounting](../model-catalogue-publication.md#exact-decimal-accounting)
+for limits, examples and provider-free distributed HTTP/WebSocket coverage.
+This authoritative slice preserves source scopes and leaves #10295 and #10290
+open; no new promotion, successor or generalized tariff behavior is activated.
+
 An omitted price is not automatically zero. An unavailable cache-write price is
 different from a published zero-cost cache write.
 
@@ -1111,7 +1133,7 @@ describe the **legacy baseline**, not a new universal normalization policy.
 | Unversioned operator overlay | Exact dated cost wins before base prefix; a base can match specialized suffixes; queries do not match in Phase 1 fixtures. | Keep the open legacy reader; new strict overlays use deterministic exact/alias/family specificity with declared exclusions for specialized variants. |
 | Configured shared catalogue | `AWF_MODEL_PRICING_CATALOG` v1 strips prefix/date, normalizes separators/case, uses configured provider aliases, selects long tier only when input tokens **exceed** threshold. Carries `shared_catalog`, ID and version; outranks complete runtime pricing. | Map to `configured_catalog` pricing authority, **not** fetched-feed authority. Preserve existing acceptance, provider aliases, component rates, threshold boundary and accounting. Never apply new strict-format rejection retroactively. |
 | Fetched central feed | No corresponding Phase 1 loader exists. | Explicit source/revision, freshness, integrity and offline policy; price and harness only, below complete fresh runtime pricing and the existing configured catalogue. A failed custom source never triggers an unconfigured default. |
-| Curated and `models.dev` | Curated precedes bundled import. The legacy `models.dev` resolver strips any provider prefix and indexes the bare normalized slug; the credit guard calls it without a provider, so the same slug at another provider can resolve. | Preserve reviewed facts ahead of governed imports. Provider-qualified imported pricing is a future behavior change and requires parity review; do not imply that legacy lookup preserves provider identity. |
+| Curated and `models.dev` | Historical adapters strip prefixes and index bare normalized slugs; they remain for unrelated consumers. Active accounting now reads generated maintained pricing and governed provider-scoped imports. | Preserve maintained facts ahead of imports. OpenRouter imports require the OpenRouter backend and exact publisher namespace; native compatibility is explicit policy, not manufacturer-based billing inference. See the active fallback migration below. |
 | Specialized family variants | `gpt-5.5-pro` has mapping but no routing metadata; `gpt-5.6-cyber` is not a host-supported model. | Explicit exact exceptions or exclusions; family rules cannot manufacture capabilities, availability or verified pricing. |
 | `/reflect` and `models.json` | Phase 1 fixtures freeze current fields and meanings. | Extend **the existing `/reflect`** additively with an optional versioned model-information section. Do not negotiate endpoints or change the legacy snapshot shape in place. |
 
@@ -1223,12 +1245,12 @@ The broader pricing/eligibility migration remains separately gated.
 
 | Source of facts | Consumer and compiled projection | Activation |
 | --- | --- | --- |
-| `shared/model-information/sources/copilot-{main,claude,gemini,other}.json` (Copilot-qualified exact records grouped by ID family, **not** asserted billing provider; lifecycle, CLI support and curated tiers) | `src/model-information.compat.generated.json`, `containers/api-proxy/model-information.{pricing,retired}.generated.json` | Host lifecycle and proxy retirement projections active under the partial Gate 4 migration below; pricing remains staged until Gate 5. |
+| `shared/model-information/sources/copilot-{main,claude,gemini,other}.json` (Copilot-qualified exact records grouped by ID family, **not** asserted native billing provider; lifecycle, CLI support and curated tiers) | `src/model-information.compat.generated.json`, `containers/api-proxy/model-information.{pricing,retired}.generated.json` | Host lifecycle, proxy retirement and maintained Copilot pricing projections are active. Staged target corrections remain separate. |
 | `shared/model-information/sources/pricing-reference.json` (reviewed reference coverage, provider documentation and dates; rates derive from canonical tiers, with explicitly recorded reasoning-equals-output baseline) | `containers/api-proxy/ai-credits-pricing-reference.json` | Active test oracle only, not a runtime configured catalogue or feed. |
 | `shared/model-information/sources/mapping.json` (pinned endpoint family/ordering, patterns, routing, provenance) | `docs/model-api-mapping.json`, `containers/api-proxy/model-api-mapping.json` | Active byte-identical compatibility format, no routing behavior change. |
 | `shared/model-information/sources/target.json` (#10029/#10030 evidence and exact corrections) | `shared/model-information/target.generated.json`, `baseline-to-target.generated.json` | Staged only; named changes require explicit Gates 4–6 activation/review. |
 | Complete assembled maintained sources | `shared/model-information/catalog.generated.json`, `manifest.generated.json` | Static validated exports; not a central feed or live resolver input. |
-| `containers/api-proxy/models.dev.catalog.json` and `shared/model-information/imported/legacy-models-dev.metadata.json` (pinned raw bytes and provenance, not a billing-provider mapping) | Governed imported snapshot | Staged only; legacy bare-slug runtime lookup remains unchanged until Gate 5. |
+| `containers/api-proxy/models.dev.catalog.json` and `shared/model-information/imported/legacy-models-dev.metadata.json` (pinned raw bytes and provenance, not a native billing-provider mapping) | Governed imported snapshot and `containers/api-proxy/model-information.fallback-pricing.generated.json` | Active only for OpenRouter's full qualified IDs. Native-provider compatibility associations in `sources/pricing-reference.json` are explicit legacy accounting policy, not verified current billing evidence. |
 
 The host support/suggestion tests in `src/copilot-model.test.ts` and
 `src/copilot-model-catalog-sync.test.ts` characterize the existing host
@@ -1327,7 +1349,8 @@ This bounded migration **does not complete or close #10294**.
   tree. Named host/proxy regressions retain their different matching boundaries,
   suggestion ties, staged exclusions, and errors.
 
-**Still open:** there is no verified linked `github/gh-aw` agreement or companion
+**At this compatibility-reader milestone:** there was no verified linked
+`github/gh-aw` agreement or companion
 implementation for this exact payload. No workflow/config keys or schema have
 been introduced, and no compiler-to-AWF round-trip coverage is claimed. The
 cross-repository blocker above remains binding. Run-local overlays, conflict
@@ -1340,6 +1363,243 @@ and the reusable Phase 6 structured eligibility API are also still required;
 neither should infer verified harness support from this compatibility reader or
 from missing constraints. Leave the phase issue open until those requirements
 and the companion round-trip evidence land.
+
+#### Bounded Phase 4 slice: scoped eligibility and re-evaluation
+
+The shared `shared/model-information/eligibility.js` contract consumes an
+already-resolved canonical identity, an explicit provider/channel/deployment
+scope, and evidence. It does not resolve identities again, infer availability
+from aliases or families, or infer a harness floor from a model name. Generated
+copies use the existing host and API-proxy contract packaging mechanism.
+The bundled harness projection is currently empty: no minimum is synthesized
+to fill gaps in authored facts or actual-environment observations.
+
+The decision distinguishes `eligible`, `incompatible`, and `unknown`, with
+structured reasons and a separate admission result. Harness evidence separately
+distinguishes unconstrained, compatible, incompatible, and unverified outcomes.
+`evaluateEligibility({ identity, scope, discovery, lifecycle, policy, harnesses,
+observations, executionEnvironment, selectedHarness })` returns an immutable
+`{ identity, scope, status, admitted, reasons, harness }` decision. Discovery uses
+`available`/`unavailable`/`unknown` plus an `authoritative` flag; policy uses
+`allow`/`deny`/`unknown`; lifecycle uses canonical lifecycle statuses. These are
+evidence inputs, not instructions to fetch or probe anything.
+The decision also retains `selectedHarness` when supplied and valid.
+An unconstrained candidate can retain legacy admission without claiming verified
+harness compatibility. Missing discovery evidence is not authoritative discovery
+absence; consumers retain their existing provider-specific discovery rules.
+In particular, `status: unknown` can coexist with `admitted: true` when only
+discovery is unknown and no applicable safety constraint requires that evidence.
+Lifecycle retirement and policy denial remain distinct from discovery and harness
+requirements. Pricing is not an eligibility input: concrete missing-price usage
+now uses a warned same-backend family/backend median accounting estimate after
+configured defaults. The warning and AI-credit undercount boundary introduced in
+issue #10757 remains only when that backend has no eligible priced donors.
+
+Harness requirements reuse the canonical `scope`, `name`, `scheme`, `minimum`,
+optional `excludedRanges`, `reason`, and `provenance` fields. Scope matching is
+exact, including an absent versus present deployment; requirements cannot leak
+between providers, channels, or deployments. An explicitly supplied
+`selectedHarness` additionally restricts requirements to that exact harness name:
+a Copilot CLI floor is not an Aider/Codex floor on the same native API channel.
+Other-harness constraints yield an unconstrained result, not verified support.
+Absent selection retains conservative checks of all scoped requirements; malformed
+selection cannot discard applicable constraints. Selection is a trusted execution
+input, never inferred from installed binaries or arbitrary observations.
+A selected-harness observation must
+identify the same scope, harness, and execution environment and explicitly be
+actual, verified evidence (`environment` matching `executionEnvironment`,
+`actual: true`, and `verified: true`). A host installation cannot satisfy a
+requirement on the container, chroot, or guest binary. Unknown, missing, malformed, or otherwise
+unverified observations cannot satisfy an applicable requirement.
+
+`semver` compares three numeric release components, then SemVer prerelease
+identifiers (numeric identifiers before text, numeric comparison rather than
+lexicographic comparison, release after prerelease); build metadata does not
+affect precedence. `numeric-components` compares dot-separated nonnegative
+integers numerically, with missing trailing components treated as zero.
+Both schemes reject leading zeroes in numeric components (except `0`), version
+prefixes such as `v`, and whitespace; numeric-components does not accept prereleases.
+Excluded ranges use explicit comparison operators, whitespace conjunctions and
+`||` alternatives, rather than package-manager shorthand. Invalid constraints
+and ranges fail closed as unverified, not compatible.
+
+The evidence store exposes immutable request snapshots. Replacing accepted
+local facts or execution-environment observations changes subsequent snapshots;
+it never mutates an in-flight decision. Requests carry the pinned snapshot through
+candidate selection and retries independently of their existing pinned catalogue
+and runtime pricing. Eligibility refresh neither reprices recorded usage nor
+upgrades a harness. Structured reasons are reusable by Phase 6 and later additive
+Phase 7 exports; this slice adds no public endpoint or CLI.
+`createEligibilityStore({ models, observations, executionEnvironment, selectedHarness })` is the
+trusted in-process boundary: `pin()` captures a revision and `evaluate(input)`,
+while `replace(next)` replaces evidence for future pins. Model entries associate
+canonical identities with explicit harness constraints. Neither request bodies
+nor attribution headers supply verified observations. This consumes accepted
+canonical facts; it is not an overlay ingestion, authentication, or conflict
+resolution API.
+The proxy wrapper exposes `createProxyEligibilityStore` and
+`replaceTrustedEvidence`; bundled constraints remain conjunctive with supplied
+constraints. Internal request context carries `awfEligibility` and an optional
+trusted `awfEligibilityScope`, copied and frozen at pinning. Standard listener
+scopes default to `copilot-api` for Copilot and `native-api` otherwise; deployment
+scope is supplied explicitly, never guessed from a model name or client header.
+
+Consumer adapters preserve their outward interfaces and existing guards:
+
+- Host `validateCopilotModel` retains its generated CLI support/retirement
+  projection and canonical identity matching, with an explicit evidence boundary.
+- HTTP `enforceGuards` rejects applicable unsatisfied/unverified requirements with
+  required/detected version, scope, and reason information.
+- `resolveModel` and `resolveModelSelector` evaluate alias/selector candidates;
+  explicit selections carry their decision to the ordered HTTP guard rather
+  than silently substituting another model. `buildRoutingCandidates` admits
+  routing choices;
+  `selectNextFallbackCandidate` admits ordered fallback attempts; and
+  `getAutomaticRecoveryCandidates` admits bounded compatible recovery. They use
+  the same decision. Exhaustion retains the consumer's existing error path.
+- Request protocol/features, effort and known limits, network policy, per-attempt
+  budgets, and enclave capabilities remain independently enforced. Recovery keeps
+  configured-fallback precedence, bounds, and opt-outs; opaque WebSocket sessions
+  are not rewritten or replayed.
+
+#### Bounded Phase 4 slice: actual-environment harness observations
+
+The supported product targets are **cloud-hypervisor, nvx, docker, and arc/dind**.
+ARC/DinD is a Docker deployment topology, not a separate runtime backend.
+Runtime enum values and historical backend implementations are not a product
+support list: sbx is not supported, and runc/gVisor/Kata are not separate
+supported product targets.
+
+The host produces selected-harness observations through the existing ready
+Cloud Hypervisor execution channel and a Docker command-shell pre-command gate,
+after backend startup and before primary command execution.
+Selection is deliberately limited to direct `copilot`, `claude`, and
+`codex` executables (including simple absolute or `./` paths), mapped to the
+exact harness identifiers `copilot-cli`, `claude-code`, and `codex-cli`.
+These names are not aliases for arbitrary constraint names. Shell wrappers,
+environment assignments, quoted executable paths, command substitutions and
+compound commands remain `selection_unavailable`; installing a binary alone
+never establishes selection.
+
+| Target / execution context | Observation coverage |
+|---------|----------------------|
+| Cloud Hypervisor primary guest | Existing `manager.execute` channel, same guest UID/GID, environment, cwd and login shell as the primary command |
+| Docker primary agent | Generated command prelude runs the probe after the existing entrypoint's identity, chroot, environment, PATH and cwd setup; user command waits for host publication/recheck and release |
+| ARC/DinD (Docker deployment topology) | Same Docker producer, with container-local private tmpfs control transport via Docker exec; public report publication retains existing runner-visible log-mount translation |
+| NVX | Explicit `runtime_probe_unsupported`; its one-shot execute lifecycle exposes no persistent ready guest for a separate observation |
+| Enclave executors | No primary observation is attached to the dedicated enclave proxy; per-invocation enclave observation remains unimplemented |
+
+Supported probes resolve the selected executable with `command -v` and run only
+its `--version`, with a 10-second timeout and 4096-byte stdout bound. Version
+formats are intentionally strict: Copilot's bare or named three-component
+version (optional `v`), Claude's `version (Claude Code)`, and Codex's
+`codex-cli version`. Existing shared eligibility retains responsibility for
+SemVer/numeric-components comparison, prereleases and exclusions. Unrecognized
+output never becomes a guessed version. Only a bounded executable path, parsed
+version, exact selection, unique per-run environment identifier and finite
+failure classification survive; stderr, error messages and informational
+metadata are discarded. The environment identifier denotes the agent boundary,
+not the host installation.
+
+Docker's prelude runs in the final command shell, with the version subprocess
+inheriting the command's UID/GID, environment, PATH and working directory.
+The probe launcher suppresses additional shell-startup evaluation and restores
+the exported `BASH_ENV` for the executable itself, so startup files do not
+silently select a different PATH or environment. It does not use a separately
+initialized Docker exec shell to discover the executable.
+The existing entrypoint (including pinned images) needs no new
+handshake support: Compose injects the prelude and private tmpfs pairs for
+chroot/non-chroot execution. Only the active pair is used. Each pair has a
+root-owned, 0711 control directory and a nested 0700, command-identity-owned
+probe directory. Only the host's Docker exec can write the release file; the
+unprivileged probe can write its bounded output, not authorize the command.
+Raw probe output is bounded to 4097 bytes (one overflow sentinel)
+and stderr is discarded; raw output never enters container logs or the proxy
+mount. The host reads the bounded result via Docker exec, checks its per-run
+environment binding, publishes the canonical sanitized report and rechecks
+applicable CLI eligibility before atomically releasing the command gate.
+Neither rendezvous path is a runner/daemon host bind mount or exposed to
+dedicated enclave proxies. Ordinary ARC/DinD path translation still governs
+the public report's existing log mount.
+
+Docker readiness and gate-release waits are each bounded to 120 seconds;
+version execution has a 10-second deadline with a one-second forced-kill
+grace. Failed version evidence can still release an unconstrained command;
+failed readiness/transport or an applicable failed eligibility recheck cannot.
+An abandoned gate exits 125 without starting the user command. Normal command
+stdout/stderr and exit status remain owned by the existing container lifecycle;
+its timeout/cancellation/cleanup tears down the waiting container and its tmpfs.
+If entrypoint/preflight already exited before reaching the gate, the host
+requires an exited container with this run's environment label before handing
+back to the existing log/exit-status collection, without issuing any release.
+Historical non-default OCI backend names do not gain additional producer
+coverage in this slice.
+
+`src/harness-observation.ts` initializes explicit unavailable/pending evidence
+before Compose generation, then atomically publishes the observation to
+`harness-observation.json` in the existing primary API-proxy log mount.
+AWF-owned sidecar process configuration pins the expected environment and
+selection; request bodies, headers, catalogues and compiler overlays cannot
+choose them. The file reader bounds and validates evidence, rejecting missing,
+malformed, wrong-environment and wrong-harness records as unverified. It binds
+the runtime binary observation to the consumer's exact provider/channel/deployment
+scope rather than inferring a provider from the binary. Dedicated enclave
+proxies do not inherit this primary process configuration.
+
+Each proxy eligibility pin captures both the existing canonical-fact snapshot
+and one observation report. Subsequent requests see a newly published report;
+in-flight selection, routing, fallback and recovery retain their original
+immutable evidence. All existing consumers still call shared eligibility.
+Failures add an `observationReason` alongside (not instead of) the canonical
+requirement reason. The host also supplies the report when rechecking concrete
+`COPILOT_MODEL` CLI selections (flags, env files or opted-in host env) after backend
+readiness. Pre-start offline validation preserves naming/retirement checks but
+defers an otherwise-known direct Copilot model's unverified harness decision to
+that ready-runtime check on Cloud Hypervisor and Docker (including ARC/DinD).
+Alias candidate expansion and
+its final harness eligibility remain proxy-owned; custom provider paths retain
+their existing validation exemption. No applicable constraint means legacy admission, not a claim of
+verified compatibility.
+
+This is model-management evidence, **not adversarial execution attestation**:
+it does not pin an executable inode, prevent later PATH/binary replacement,
+observe binaries chosen inside opaque commands, or verify every subsequent
+subprocess/session sharing a proxy. It adds no protected spawn, controller,
+authentication scheme or compiler field. Routing's pre-agent infrastructure
+gate is not moved: Compose routing cannot obtain verified primary-harness
+evidence before agent launch and therefore remains explicitly unverified for
+applicable constraints. Other policy, lifecycle, protocol/feature/effort/limit,
+network, budget and enclave-capability guards are not relaxed.
+
+Deterministic tests cover backend invocation context, bounds and timeouts,
+producer-to-file-to-eligibility wiring, host and HTTP admission, automatic
+candidate filtering, failure/mismatch cases and immutable refresh. Generated
+host/proxy assets and a bundled host consumer are exercised outside the source
+tree. Docker regression fixtures execute the generated prelude and Docker-exec
+rendezvous scripts in local shells, covering context equality, ordering,
+timeout/output bounds, failure, cancellation and exit propagation. Their
+ARC/DinD variants exercise configuration/transport separation, not a live split
+runner/daemon deployment. On macOS, the deterministic shell fixture substitutes
+a test-only process-group supervisor for GNU `timeout`. These fixtures do not
+establish live KVM guest compatibility or exercise live Docker, NVX or ARC/DinD
+deployments. Live Docker and ARC/DinD acceptance must be recorded separately
+when infrastructure is available; no live provider inference or workflow
+dispatch is needed.
+
+**Remaining handoff:** the actual observation producer for NVX is still missing;
+product support does not imply observation capability. Per-invocation enclave observations,
+opaque commands and per-session attribution, and complete pre-start enforcement
+on lifecycles without observation capability remain open. This slice keeps the bundled
+constraint projection empty. An opaque
+session whose model is not visible cannot acquire verified harness eligibility.
+Workflow/operator overlay
+transport, contribution conflict/provenance rules, and compiler round trips
+remain under #10294 and
+[github/gh-aw#70728](https://github.com/github/gh-aw/issues/70728).
+The runtime loader still rejects unsupported explicit feed harness constraints;
+full activation requires complete actual-environment enforcement and a separately
+reviewed producer/consumer capability boundary. This slice does not close
+issues #10294, #10295, or parent #10290; it does not complete Phases 5–7.
 
 ### Gate 5: Pricing resolver
 
@@ -1370,6 +1630,98 @@ explicit harness constraints reject activation. Existing bundled pricing and
 legacy provider-component fallback remain unchanged. This is not full Gate 5:
 exact arithmetic, general provider-qualified governed imports, execution-version
 eligibility, full resolver migration and compiler handoff remain outstanding.
+
+**Authoritative shared pricing cutover (#11111, delivered in #11113):** the user-directed rollout
+replaces the initial shadow-only proposal in the same PR.
+`shared/model-information/pricing-resolution.js::resolvePricing`, generated with
+declarations into host/proxy contract assets, now drives real AI-credit
+accounting and priceability checks. There is no legacy-authoritative selection,
+shadow comparison or silent fallback to the removed resolver.
+
+The shared engine lazily reads normalized facts from existing source adapters:
+operator overlay, configured catalogue v1, provider snapshot, scoped central
+snapshot, curated fallback, legacy import, selector policy, configured default
+and unknown-sentinel policy. It owns priority, strict long-context tier selection,
+central freshness/effective intervals/exact provider-channel-deployment scope,
+and four-component provider/fallback merging. Direct operator/configured/runtime/
+central resolver APIs also use the shared tariff-selection functions.
+Matching/parsing and policy-rate construction remain adapter-owned; this is not
+a full adapter rewrite or governed-import migration.
+
+The input carries provider-qualified identity (when a provider is supplied),
+explicit scope, input-token count and the request's captured feed time/revision
+and provider observations. Each reached source is read once. Operator/configured
+selection does not initialize lower-priority providers or the loader. Tariff
+selection does not fetch again, mutate request pins, observe a later refresh,
+warn or account usage itself. An absent/not-reached feed has null time.
+The host adapter emits the existing warning only when the shared outcome calls
+for it. Quiet priceability probes use the same authoritative resolver without
+missing-price warnings or accounting side effects.
+
+Existing valid prices/charges, budget caps, unpriced warnings/undercount, selector
+ceilings, configured defaults, unknown sentinel, recovery, opt-outs, channel/BYOK
+boundaries and opaque WebSocket behavior are retained. The merge retains selected
+runtime-tier compatibility and the existing stale-complete-provider fallback
+behavior; this cutover is not a new freshness correction. Component provenance is
+available in the shared outcome; accounting keeps its existing source/tier fields
+and four-component merge shape. No staged target-price changes are activated.
+
+**Intentional failure behavior:** missing prices are still unpriced, never free.
+A selected tariff containing invalid/nonfinite/negative numeric components is a
+resolution failure, not a priceable tariff. Genuine zero and explicit null
+cache-write remain distinct from missing fields. Resolver/source failures log
+`pricing_resolution_error` with a fixed sanitized reason/message and produce an
+explicit error, never a legacy fallback or fabricated price. Pre-dispatch
+failures return a structured HTTP/WebSocket 500. If usage-time accounting fails
+after a response is already in flight, it is logged, reflection adds
+`pricing_error: "pricing_resolution_error"`, and subsequent dispatch is blocked
+until proxy restart/configuration repair. Recorded credits are not invented or
+retroactively adjusted; already-running responses cannot be recalled.
+
+Deterministic regressions and provider-free smoke tests cover source priority,
+complete/partial/stale provider tariffs, exact threshold/freshness boundaries,
+central scope/BYOK, legacy import/case/prefix policy, zero/null/missing components,
+reasoning, selectors/defaults/sentinel/unpriced policy, HTTP/WebSocket usage
+tracking, source refresh/pins, budget charges and explicit error blocking.
+Injected shared tariffs demonstrably change real charges and budget decisions.
+The smoke script executes actual proxy/accounting modules from both the off-tree
+Docker application context and an extracted npm package, prohibits network
+access, uses fixture feed refreshes, and requires zero network calls. It does
+not invoke a provider, dispatch a workflow or run a live container/VM.
+Legacy cross-provider import slug collisions remain explicit fixtures, not a
+provider-qualified import correction in that earlier cutover.
+
+**Active canonical fallback sources (follow-up to #11113):** accounting now reads
+the generated maintained pricing projection and governed imported pricing through
+the existing `catalogue-pricing.js` adapter, not the legacy curated/import
+lookups. The compiler distributes a scoped import/compatibility projection
+alongside the existing maintained projection. All 42 Copilot rates, both strict
+context boundaries, and source priority remain unchanged. Sixteen native
+OpenAI/Anthropic associations are explicitly labeled legacy compatibility policy,
+retaining source provenance without asserting current billing verification.
+OpenRouter imports require pricing-provider identity `openrouter` and full
+publisher-qualified wire IDs; they cannot price Copilot, native APIs or arbitrary
+compatible backends. Exact IDs win before source-local normalization; ambiguous
+matches fail with the existing sanitized resolver error.
+
+The packaged provider-free smoke now verifies the new sources and generated
+same-slug import fixtures through real HTTP/WebSocket usage and budget paths,
+including shipped charge deltas and refresh pinning, with zero network calls.
+The [source and charge migration](../model-catalogue-publication.md#active-canonical-fallback-pricing)
+documents the three changed default imported rate vectors, two removed
+cross-backend tier inheritances, 39 no-longer-resolved unreviewed slug aliases,
+and narrowed native/custom coverage. Unpriced requests still warn/proceed and
+their charges remain excluded, never fabricated as free or made an execution
+admission requirement. No staged target tariffs are activated, and there is no
+new shadow/parity waiting gate.
+
+This is not completion of #10295 or #10290. Concrete remaining gates include
+exact-decimal accounting; fully compatible assembled tariffs across units/
+currency/token ranges/effective dates; general promotion/successor and non-token
+charges; broader consumer
+migration and release/live-environment evidence. These are not prerequisites
+for this cutover. Harness constraints remain empty/disabled; pricing does not
+establish executability or change runtime invocation/compiler overlays.
 
 ### Gate 6: Reasoning and compatibility
 

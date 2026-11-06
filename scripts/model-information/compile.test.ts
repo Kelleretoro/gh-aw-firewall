@@ -39,11 +39,96 @@ describe('maintained model compilation', () => {
       .toEqual(fs.readFileSync(path.join(root, 'containers/api-proxy/model-api-mapping.json')));
   });
 
+  it('projects only original reviewed identities, without imports or staged target changes', () => {
+    const naming = require('../../shared/model-information/naming.generated.json');
+    const sourceDir = path.join(root, 'shared/model-information/sources');
+    const sources = fs.readdirSync(sourceDir).sort().map(file =>
+      JSON.parse(fs.readFileSync(path.join(sourceDir, file), 'utf8')))
+      .filter(source => Array.isArray(source.models));
+    const identities = sources.flatMap(source => source.models.map(
+      (model: { identity: unknown }) => ({ identity: model.identity }),
+    )).sort((a, b) => a.identity.key < b.identity.key ? -1 : a.identity.key > b.identity.key ? 1 : 0);
+    expect(naming.models).toEqual(identities);
+    expect(naming.rules).toEqual(sources.flatMap(source => source.rules || []));
+    expect(naming.models).not.toContainEqual(expect.objectContaining({
+      identity: expect.objectContaining({ key: 'copilot/gemini-3.8-flash' }),
+    }));
+    const bytes = fs.readFileSync(path.join(root, 'shared/model-information/naming.generated.json'));
+    for (const file of ['containers/api-proxy/model-information.naming.generated.json',
+      'src/model-information.naming.generated.json']) {
+      expect(fs.readFileSync(path.join(root, file))).toEqual(bytes);
+    }
+    for (const file of ['identity.js', 'identity.d.ts', 'resolution.js', 'resolution.d.ts', 'eligibility.js', 'eligibility.d.ts',
+      'harness-observation.js', 'harness-observation.d.ts']) {
+      const shared = fs.readFileSync(path.join(root, 'shared/model-information', file));
+      expect(fs.readFileSync(path.join(root, 'src/model-information-contract', file))).toEqual(shared);
+      expect(fs.readFileSync(path.join(root, 'containers/api-proxy/catalogue-contract', file))).toEqual(shared);
+    }
+  });
+
+  it('projects exact canonical harness records without synthesizing family floors', () => {
+    const projected = require('../../src/model-information.eligibility.generated.json');
+    const catalogue = require('../../shared/model-information/catalog.generated.json');
+    expect(projected.models).toEqual(catalogue.models.filter((model: any) => model.harnesses?.length)
+      .map((model: any) => ({ identity: model.identity, harnesses: model.harnesses })));
+    expect(require('../../containers/api-proxy/model-information.eligibility.generated.json')).toEqual(projected);
+  });
+
+  it('packages dependency-free eligibility for a standalone proxy context', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eligibility-package-'));
+    try {
+      const fixturePath = fs.realpathSync(directory);
+      const checkoutPath = fs.realpathSync(root);
+      expect(fixturePath).not.toBe(checkoutPath);
+      expect(fixturePath.startsWith(checkoutPath + path.sep)).toBe(false);
+      fs.copyFileSync(path.join(root, 'containers/api-proxy/catalogue-contract/eligibility.js'),
+        path.join(directory, 'eligibility.js'));
+      expect(execFileSync(process.execPath, ['-e',
+        "const assert=require('node:assert/strict');const {evaluateEligibility:e}=require('./eligibility');const r=e({identity:{key:'copilot/test',provider:'copilot',rawId:'test',lookupId:'test'},scope:{provider:'copilot',channel:'copilot-api'}});assert.equal(r.admitted,true);assert.equal(r.harness,'unconstrained');assert(Object.isFrozen(r));"],
+      { cwd: directory, encoding: 'utf8' })).toBe('');
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('packages host and proxy harness observation assets without source-relative imports', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-observation-package-'));
+    try {
+      fs.mkdirSync(path.join(directory, 'catalogue-contract'));
+      for (const file of ['harness-observation.js', 'eligibility.js']) {
+        fs.copyFileSync(path.join(root, 'containers/api-proxy/catalogue-contract', file),
+          path.join(directory, 'catalogue-contract', file));
+      }
+      fs.copyFileSync(path.join(root, 'containers/api-proxy/harness-observation.js'),
+        path.join(directory, 'harness-observation.js'));
+      buildSync({
+        entryPoints: [path.join(root, 'src/harness-observation.ts')],
+        outfile: path.join(directory, 'host.js'), bundle: true, platform: 'node', format: 'cjs',
+      });
+      expect(execFileSync(process.execPath, ['-e', `
+        const assert = require('node:assert/strict');
+        const host = require('./host');
+        const env = host.harnessProxyEnvironment({agentCommand:'copilot --model x', containerRuntime:'cloud-hypervisor'});
+        assert.equal(env.AWF_SELECTED_HARNESS, 'copilot-cli');
+        assert.match(env.AWF_HARNESS_ENVIRONMENT, /^cloud-hypervisor:/);
+        const contract = require('./catalogue-contract/harness-observation');
+        const context = {environment:env.AWF_HARNESS_ENVIRONMENT,name:'copilot-cli',binary:'copilot'};
+        const report = contract.parseProbe(context,{exitCode:0,stdout:'/bin/copilot\\n1.2.3\\n'});
+        assert.equal(report.status, 'observed');
+        assert.equal(contract.eligibilityEvidence(report,{provider:'openai',channel:'native-api'}).observations[0].version,'1.2.3');
+        Object.assign(process.env, env);
+        assert.equal(require('./harness-observation').readHarnessObservation().status, 'unavailable');
+      `], { cwd: directory, encoding: 'utf8' })).toBe('');
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('includes schema and compiler version in revision', () => {
     const manifest = require('../../shared/model-information/manifest.generated.json');
     const catalogue = require('../../shared/model-information/catalog.generated.json');
     expect(manifest.catalogRevision).toBe(catalogue.catalogRevision);
-    expect(manifest.compilerVersion).toBe(4);
+    expect(manifest.compilerVersion).toBe(6);
     expect(manifest.schemaHash).toMatch(/^[0-9a-f]{64}$/);
     expect(catalogue.generatedAt).toBe(manifest.generatedAt);
     expect(manifest.sourceFiles).toEqual(expect.arrayContaining([
@@ -53,7 +138,7 @@ describe('maintained model compilation', () => {
     expect(manifest.sourceFiles).not.toContain('shared/model-information/imported/legacy-models-dev.snapshot.v1.json');
   });
 
-  it('keeps historical runtime prices frozen while allowing a reviewed staged price projection', () => {
+  it('updates active maintained pricing from canonical sources without editing the historical table', () => {
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'awf-model-staged-price-'));
     try {
       for (const directory of ['scripts/model-information', 'shared/model-information']) {
@@ -68,14 +153,26 @@ describe('maintained model compilation', () => {
       const source = JSON.parse(fs.readFileSync(sourcePath, 'utf8'));
       const model = source.models.find((entry: { identity: { rawId: string } }) =>
         entry.identity.rawId === 'gpt-5-codex-mini');
-      model.tariffs[0].components.input.price = '9';
+      model.tariffs[0].components.input.price = '9.0000000000000000000000000001';
       fs.writeFileSync(sourcePath, JSON.stringify(source));
       const tempCompiler = path.join(temp, 'scripts/model-information/compile.cjs');
       execFileSync(process.execPath, [tempCompiler], { cwd: temp });
       const staged = JSON.parse(fs.readFileSync(
         path.join(temp, 'containers/api-proxy/model-information.pricing.generated.json'), 'utf8',
       ));
-      expect(staged['gpt-5-codex-mini'].input).toBe(9);
+      expect(staged['gpt-5-codex-mini'].input).toBe('9.0000000000000000000000000001');
+      const active = JSON.parse(fs.readFileSync(
+        path.join(temp, 'containers/api-proxy/model-information.fallback-pricing.generated.json'), 'utf8',
+      ));
+      expect(active.imported.copilot).toBeUndefined();
+      expect(active.imported.openai).toBeUndefined();
+      expect(active.compatibility).toMatchObject({
+        authority: 'policy', confidence: 'policy_fallback', channel: 'native-api',
+        sourceProvenance: require('../../shared/model-information/sources/pricing-reference.json').provenance,
+      });
+      expect(Object.keys(active.imported.openrouter)).toHaveLength(
+        require('../../shared/model-information/imported/legacy-models-dev.snapshot.v1.json').accepted,
+      );
       expect(require('../../containers/api-proxy/ai-credits-pricing')['gpt-5-codex-mini'].input).toBe(0.25);
       expect(execFileSync(process.execPath, [tempCompiler, '--check'], { cwd: temp, encoding: 'utf8' }))
         .toContain('Checked');
@@ -89,6 +186,35 @@ describe('maintained model compilation', () => {
       { at: '2026-10-19T17:20:11-07:00' },
       { at: '2026-10-21T00:00:00Z' },
     ])).toBe('2026-10-21T00:00:00.000Z');
+  });
+
+  it('does not flatten unsupported maintained tariff scope, dates, units or missing components', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'awf-pricing-scope-'));
+    try {
+      fs.cpSync(path.join(root, 'shared/model-information/sources'), directory, { recursive: true });
+      const file = path.join(directory, 'copilot-main.json');
+      const original = JSON.parse(fs.readFileSync(file, 'utf8'));
+      for (const change of [
+        { scope: { provider: 'copilot', channel: 'copilot-cli' } },
+        { scope: { provider: 'copilot', channel: 'copilot-api', deployment: 'private' } },
+        { unit: 'USD_PER_TOKEN' },
+        { currency: 'EUR' },
+        { effectiveUntil: '2027-01-01T00:00:00Z' },
+        { components: {} },
+      ]) {
+        const source = structuredClone(original);
+        const model = source.models.find((entry: { tariffs?: unknown[] }) => entry.tariffs?.length);
+        Object.assign(model.tariffs[0], change);
+        fs.writeFileSync(file, JSON.stringify(source));
+        const result = spawnSync(process.execPath, [compiler, '--check', `--source-dir=${directory}`], {
+          cwd: root, encoding: 'utf8',
+        });
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toMatch(/Unsupported maintained fallback tariff|currency|components/);
+      }
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('stages named pricing and routing corrections without activating them', () => {
@@ -319,17 +445,61 @@ describe('maintained model compilation', () => {
 
   it('resolves generated proxy assets independently of repository shared modules', () => {
     const dockerfile = fs.readFileSync(path.join(root, 'containers/api-proxy/Dockerfile'), 'utf8');
-    expect(dockerfile).toMatch(/model-information\.pricing\.generated\.json model-information\.retired\.generated\.json/);
+    expect(dockerfile).toMatch(/model-information\.pricing\.generated\.json model-information\.fallback-pricing\.generated\.json model-information\.retired\.generated\.json/);
+    expect(dockerfile).toMatch(/model-eligibility\.js harness-observation\.js/);
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'awf-model-assets-'));
     try {
+      const fixturePath = fs.realpathSync(temp);
+      const checkoutPath = fs.realpathSync(root);
+      expect(fixturePath).not.toBe(checkoutPath);
+      expect(fixturePath.startsWith(checkoutPath + path.sep)).toBe(false);
       fs.mkdirSync(path.join(temp, 'guards'));
       for (const file of ['model-information.pricing.generated.json',
         'model-information.retired.generated.json', 'model-api-mapping.json', 'model-api-mapping.js',
-        'guards/retired-model-guard.js', 'logging.js']) {
+        'model-information.naming.generated.json', 'model-identity.js', 'model-utils.js',
+        'model-eligibility.js', 'harness-observation.js', 'model-information.eligibility.generated.json',
+        'provider-pricing-overlays.js',
+        'guards/retired-model-guard.js', 'guards/model-policy-guard.js', 'guards/guard-utils.js', 'logging.js']) {
         fs.copyFileSync(path.join(root, 'containers/api-proxy', file), path.join(temp, file));
       }
+      fs.cpSync(path.join(root, 'containers/api-proxy/catalogue-contract'),
+        path.join(temp, 'catalogue-contract'), { recursive: true });
       const output = execFileSync(process.execPath, ['-e',
-        "const assert=require('node:assert/strict');const m=require('./model-api-mapping');assert(m.lookupModelEndpoints('gpt-5.5','openai'));const g=require('./guards/retired-model-guard');assert.equal(g.getRetiredModelBlockState('GPT-5-CODEX').suggestion,'gpt-5.3-codex');assert.equal(g.getRetiredModelBlockState('GPT_5_CODEX'),null);"],
+        `
+        const assert = require('node:assert/strict');
+        const mapping = require('./model-api-mapping');
+        assert(mapping.lookupModelEndpoints('gpt-5.5', 'openai'));
+        const guard = require('./guards/retired-model-guard');
+        assert.equal(guard.getRetiredModelBlockState('GPT-5-CODEX').suggestion, 'gpt-5.3-codex');
+        assert.equal(guard.getRetiredModelBlockState('GPT_5_CODEX'), null);
+        const { createProxyEligibilityStore, evaluateModelEligibility } = require('./model-eligibility');
+        const { resolveModelIdentity } = require('./model-identity');
+        const scope = { provider: 'copilot', channel: 'copilot-api' };
+        const identity = resolveModelIdentity('gpt-5.3-codex', 'copilot', { scope }).identity;
+        const requirement = {
+          scope, name: 'copilot', scheme: 'semver', minimum: '2.0.0',
+          reason: 'Reviewed packaged harness fixture',
+          provenance: { authority: 'maintained', source: 'packaging-fixture' },
+        };
+        const models = [{ identity, harnesses: [requirement] }];
+        const store = createProxyEligibilityStore({ models, executionEnvironment: 'container:packaged' });
+        const pinnedRequest = { awfEligibility: store.pin() };
+        const missing = evaluateModelEligibility('gpt-5.3-codex', 'copilot', pinnedRequest);
+        assert.equal(missing.admitted, false);
+        assert.equal(missing.harness, 'unverified');
+        store.replaceTrustedEvidence({
+          models, executionEnvironment: 'container:packaged',
+          observations: [{
+            scope, name: 'copilot', version: '2.0.0', environment: 'container:packaged',
+            verified: true, actual: true,
+          }],
+        });
+        assert.equal(evaluateModelEligibility('gpt-5.3-codex', 'copilot', pinnedRequest).admitted, false);
+        const compatible = evaluateModelEligibility('gpt-5.3-codex', 'copilot', { awfEligibility: store.pin() });
+        assert.equal(compatible.admitted, true);
+        assert.equal(compatible.harness, 'compatible');
+        assert.equal(compatible.identity.key, 'copilot/gpt-5.3-codex');
+        `],
       { cwd: temp, encoding: 'utf8' });
       expect(output).toBe('');
     } finally {
@@ -340,11 +510,18 @@ describe('maintained model compilation', () => {
   it('loads the compiled and bundled host lifecycle reader outside the source tree', () => {
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'awf-host-lifecycle-'));
     try {
+      const fixturePath = fs.realpathSync(temp);
+      const checkoutPath = fs.realpathSync(root);
+      expect(fixturePath).not.toBe(checkoutPath);
+      expect(fixturePath.startsWith(checkoutPath + path.sep)).toBe(false);
       const compiled = path.join(temp, 'compiled');
       execFileSync(process.execPath, [require.resolve('typescript/bin/tsc'),
         '--target', 'es2020', '--module', 'commonjs', '--resolveJsonModule',
-        '--esModuleInterop', '--skipLibCheck', '--outDir', compiled,
-        path.join(root, 'src/copilot-model.ts')], { cwd: root, encoding: 'utf8' });
+        '--esModuleInterop', '--skipLibCheck', '--allowJs', '--outDir', compiled,
+        path.join(root, 'src/copilot-model.ts'),
+        path.join(root, 'src/model-information-contract/identity.js'),
+        path.join(root, 'src/model-information-contract/resolution.js'),
+        path.join(root, 'src/model-information-contract/eligibility.js')], { cwd: root, encoding: 'utf8' });
       const verify = (entry: string) => execFileSync(process.execPath, ['-e',
         `const assert=require('node:assert/strict');const {validateCopilotModel:v}=require(${JSON.stringify(entry)});assert.deepEqual(v(' GPT_5_3_CODEX '),{valid:true,resolvedModel:'gpt-5.3-codex'});assert.equal(v('GPT_5_CODEX').reason,'retired');assert(v('gpt-54-mini').message.includes("'gpt-5.4-mini'"));assert.equal(v('grok-4.7').valid,false);`],
       { cwd: temp, encoding: 'utf8' });

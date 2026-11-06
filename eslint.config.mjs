@@ -29,6 +29,21 @@ export default tseslint.config(
     },
   },
   {
+    files: [
+      'src/model-information-contract/*.js',
+      'containers/enclave/agent-executor/agent-provider-environment.js',
+      'scripts/ci/configure-agent-regression-build.js',
+      'scripts/ci/run-enclave-agent-regression.js',
+    ],
+    languageOptions: {
+      sourceType: 'commonjs',
+      globals: globals.node,
+    },
+    rules: {
+      '@typescript-eslint/no-require-imports': 'off',
+    },
+  },
+  {
     files: ['src/**/*.ts'],
     plugins: {
       local: localPlugin,

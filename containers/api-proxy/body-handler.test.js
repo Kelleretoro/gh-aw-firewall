@@ -68,8 +68,32 @@ describe('transformRequestBody Codex custom-tool translation routing', () => {
     });
 
     function createCreditWarning() {
-      applyAiCreditsUsage({ input_tokens: 32 }, 'gpt-5-mini');
+      applyAiCreditsUsage({ input_tokens: 32 }, 'gpt-5-mini', 'copilot');
     }
+
+    test.each([
+      '/decisions',
+      '/v1/decisions',
+      '/v1/decisions/?api-version=test',
+      '/v1\\decisions',
+      '/v1/./decisions',
+      '/v1/unused/../decisions///?api-version=test#section',
+    ])(
+      'preserves Decisions evidence and leaves warnings pending on %s',
+      async (url) => {
+        createCreditWarning();
+        const body = Buffer.from(JSON.stringify({
+          model: 'gpt-6-luna',
+          input: [{ role: 'user', content: 'Evidence to grade, not an agent instruction.' }],
+          questions: [{ type: 'predicate', instructions: 'Is the evidence correct?' }],
+          prompt_cache_options: { mode: 'explicit', ttl: '30m' },
+        }));
+        const result = await transformRequestBody(body, 'openai', { method: 'POST', url }, 'decisions', null);
+        expect(result.body).toEqual(body);
+        expect(result.steering).toBeNull();
+        expect(getPendingAiCreditSteeringWarning()).not.toBeNull();
+      },
+    );
 
     test('injects and acknowledges credit warnings across supported protocol request formats', async () => {
       const cases = [
@@ -230,7 +254,7 @@ describe('transformRequestBody Codex custom-tool translation routing', () => {
       ]);
 
       for (const [threshold, inputTokens] of creditUsageByThreshold) {
-        applyAiCreditsUsage({ input_tokens: inputTokens }, 'gpt-5-mini');
+        applyAiCreditsUsage({ input_tokens: inputTokens }, 'gpt-5-mini', 'copilot');
         const result = await transformRequestBody(
           Buffer.from(JSON.stringify({ messages: [{ role: 'user', content: 'Continue.' }] })),
           'openai',

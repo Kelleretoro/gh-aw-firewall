@@ -15,12 +15,20 @@ The Docker/runc compose agent, the gVisor/runsc compose agent, and the sbx
 microVM all read from this one source of truth, so they can no longer diverge.
 The Cloud Hypervisor microVM does not currently consult this policy: its
 production export path (`src/cloud-hypervisor/exports.ts`) only resolves the
-workspace, runner tool cache, and `RUNNER_TEMP`/`tmp/gh-aw` directories — it
-does not export `$HOME` at all, so the home allow/deny lists have no
+workspace (`rw`), the runner tool cache (`ro`, only under the non-default
+`workspace-and-tool-cache` policy, using `RUNNER_TOOL_CACHE` or its fallback
+`AGENT_TOOLSDIRECTORY`), `$RUNNER_TEMP/gh-aw` (`ro`, when `RUNNER_TEMP` is set
+and the directory exists), and `/tmp/gh-aw` (`rw`, when the directory exists) — it does not export `$HOME` at all, so the home allow/deny lists have no
 production call site for this runtime. `MicrovmWorkspaceImage`
 (`src/microvm/workspace.ts`) does read `home.toolSubdirs` and
 `credentials.entries`, but it has no production call site today; it is
 exercised only by its own tests.
+
+Mount visibility does not grant engine file scope. A mounted input directory
+still requires host read/traverse permissions and any engine-specific grant,
+such as Copilot's `--add-dir`. See
+[`--mount` does not grant engine file scope](environment.md#--mount-does-not-grant-engine-file-scope)
+for an example and fail-closed input verification guidance.
 
 ## What the policy contains
 
@@ -32,6 +40,15 @@ exercised only by its own tests.
 | `home.narrowPaths` | narrow allow override | compose + sbx + microVM workspace tests | `home-strategy.ts`, `sbx-manager.ts`, `microvm/workspace.ts` |
 | `home.forbiddenSubdirs` | deny guard | compose + sbx | invariant tests |
 | `credentials.entries` | deny (files/dirs) | compose + sbx + microVM workspace tests | `credential-hiding.ts`, `sbx-manager.ts`, `microvm/workspace.ts` |
+
+In compose, `~/.gemini` is mounted only when a Gemini or Google API key is
+configured; the other `toolSubdirs` are always bound, and `~/.copilot` is bound
+from the host only when it exists and is readable and writable. Independently,
+compose always binds the supplied session-state and agent-log paths beneath
+`~/.copilot/session-state` and `~/.copilot/logs`, even when the host directory
+is absent or inaccessible
+([`home-strategy.ts`](../src/services/agent-volumes/home-strategy.ts),
+[`workspace-mounts.ts`](../src/services/agent-volumes/workspace-mounts.ts)).
 
 The `system.*` section is compose-only: sbx gets its system libraries from a
 guest image, not from host mounts. Cloud Hypervisor also boots from a guest
@@ -77,8 +94,9 @@ mechanisms, but from the **same list**:
 
 **Cloud Hypervisor microVM** does not go through this list today. Its
 production export path (`src/cloud-hypervisor/exports.ts`) never exports
-`$HOME` — only the workspace, runner tool cache, and `RUNNER_TEMP`/`tmp/gh-aw`
-directories are exposed to the guest — so host credential dotfiles are simply
+`$HOME` — only the workspace, the runner tool cache (non-default
+`workspace-and-tool-cache` policy only), `$RUNNER_TEMP/gh-aw`, and `/tmp/gh-aw`
+are exposed to the guest — so host credential dotfiles are simply
 never part of the guest export, independent of `credentials.entries`.
 `MicrovmWorkspaceImage` (`src/microvm/workspace.ts`) does read
 `home.toolSubdirs` and exclude `credentials.entries` when staging a workspace
@@ -88,6 +106,15 @@ should be updated accordingly.
 
 In all cases the agent receives the credentials it legitimately needs through the
 API proxy or environment, never from these on-disk stores.
+
+GitLab CLI's `~/.config/glab-cli/config.yml` is included in the credential deny
+list. AWF also hides GitLab config files at host `GLAB_CONFIG_DIR`,
+`XDG_CONFIG_HOME` and `XDG_CONFIG_DIRS` locations, and macOS configuration
+locations, **when an existing mount exposes them**. Compose maps these files
+through bind sources, including custom target aliases; sbx moves exposed files
+aside and restores them after teardown. This does not add mounts for otherwise
+inaccessible credential directories. Other GitLab config files, such as
+`aliases.yml`, remain available in Compose.
 
 ## Adding an entry
 

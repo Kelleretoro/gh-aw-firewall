@@ -143,12 +143,15 @@ function createManagementHandlers(deps) {
    */
   function healthResponse() {
     const providers = {};
+    let brokerUnavailable = false;
     for (const adapter of getAdapters()) {
-      providers[adapter.name] = adapter.isEnabled();
+      const ready = adapter.renewableAuth ? adapter.isReady?.() === true : adapter.isEnabled();
+      providers[adapter.name] = ready;
+      if (adapter.renewableAuth && !ready) brokerUnavailable = true;
     }
     const { complete: kvComplete, results: kvResults } = getKeyValidationState();
     return {
-      status: 'healthy',
+      status: brokerUnavailable ? 'unavailable' : 'healthy',
       service: 'awf-api-proxy',
       ...(modelBudgetEnabled ? { model_budget_enforcement: true } : {}),
       squid_proxy: httpsProxy || 'not configured',
@@ -237,8 +240,9 @@ function createManagementHandlers(deps) {
    */
   function handleManagementEndpoint(req, res) {
     if (req.method === 'GET' && req.url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(healthResponse()));
+      const health = healthResponse();
+      res.writeHead(health.status === 'healthy' ? 200 : 503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(health));
       return true;
     }
     if (req.method === 'GET' && req.url === '/metrics') {
@@ -247,8 +251,20 @@ function createManagementHandlers(deps) {
       return true;
     }
     if (req.method === 'GET' && req.url === '/reflect') {
+      let reflection;
+      try {
+        reflection = reflectEndpoints();
+      } catch (error) {
+        if (error.code !== 'pricing_resolution_error') throw error;
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: {
+          type: 'pricing_resolution_error',
+          message: 'AI-credit pricing resolution failed; accounting could not be completed.',
+        } }));
+        return true;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(reflectEndpoints()));
+      res.end(JSON.stringify(reflection));
       return true;
     }
     return false;

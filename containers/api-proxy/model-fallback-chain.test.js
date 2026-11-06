@@ -104,6 +104,13 @@ describe('model-fallback-chain', () => {
         .toEqual({ model: 'gemini-2.5-pro', location: 'path' });
     });
 
+    test('does not extract a path model from a query-string decoy', () => {
+      expect(getRequestModel(null, '/v1/chat/completions?decoy=/models/unconstrained:generateContent'))
+        .toBeNull();
+      expect(getRequestModel(null, '/v1beta/models/constrained:generateContent?decoy=/models/unconstrained:generateContent'))
+        .toEqual({ model: 'constrained', location: 'path' });
+    });
+
     test('returns null when no model can be located', () => {
       expect(getRequestModel(Buffer.from('not json'), '/v1/chat/completions')).toBeNull();
       expect(getRequestModel(Buffer.alloc(0), undefined)).toBeNull();
@@ -122,6 +129,21 @@ describe('model-fallback-chain', () => {
       expect(normalizeFallbackModel('github-copilot/gpt-5', 'copilot')).toBe('gpt-5');
       expect(normalizeFallbackModel('anthropic/claude', 'openai')).toBe('anthropic/claude');
       expect(selectNextFallbackModel(['copilot/gpt-5', 'copilot/gpt-4.1'], ['gpt-5'], 'copilot')).toBe('gpt-4.1');
+    });
+
+    test.each([
+      ['github-copilot/gpt-5', 'copilot', 'gpt-5'],
+      ['github/gpt-5', 'copilot', 'gpt-5'],
+      ['GITHUB/GPT-UNKNOWN?effort=high', 'copilot', 'GPT-UNKNOWN?effort=high'],
+      ['google/gemini-unknown', 'gemini', 'gemini-unknown'],
+      ['gemini/gemini-unknown', 'gemini', 'gemini-unknown'],
+    ])('preserves legacy provider aliases for %s', (entry, provider, expected) => {
+      expect(normalizeFallbackModel(entry, provider)).toBe(expected);
+      expect(resolveFallbackEntry(entry, provider)).toMatchObject({
+        provider, model: expected, qualified: true,
+      });
+      expect(resolveFallbackEntry(entry, provider === 'copilot' ? 'openai' : 'copilot'))
+        .toMatchObject({ provider, model: expected, qualified: true });
     });
 
     test('skips models rejected by the permission predicate', () => {

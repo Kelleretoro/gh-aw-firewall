@@ -95,7 +95,7 @@ interface DockerService {
     /** Directory containing the Dockerfile and build context */
     context: string;
     /** Path to the Dockerfile relative to context */
-    dockerfile: string;
+    dockerfile?: string;
     /** Build arguments passed to docker build */
     args?: Record<string, string>;
   };
@@ -109,7 +109,10 @@ interface DockerService {
    * @example 'awf-squid'
    * @example 'awf-agent'
    */
-  container_name: string;
+  container_name?: string;
+
+  /** User or UID:GID to run the container process as. */
+  user?: string;
 
   /**
    * Network configuration for the container
@@ -124,7 +127,7 @@ interface DockerService {
    * @example ['awf-net']
    * @example { 'awf-net': { ipv4_address: '172.30.0.10' } }
    */
-  networks?: string[] | { [key: string]: { ipv4_address?: string } };
+  networks?: string[] | { [key: string]: { ipv4_address?: string; aliases?: string[] } };
 
   /**
    * Network mode for the container
@@ -192,10 +195,10 @@ interface DockerService {
   /**
    * Environment variables for the container
    * 
-   * Key-value pairs of environment variables. Values can include variable
-   * substitutions (e.g., ${HOME}) which are resolved by Docker Compose.
+   * Key-value pairs of literal environment variables. Dollar signs are escaped
+   * at the Compose rendering boundary, not in these canonical values.
    * 
-   * @example { HTTP_PROXY: 'http://172.30.0.10:3128', GITHUB_TOKEN: '${GITHUB_TOKEN}' }
+   * @example { HTTP_PROXY: 'http://172.30.0.10:3128' }
    */
   environment?: Record<string, string>;
 

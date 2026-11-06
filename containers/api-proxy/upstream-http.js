@@ -1,6 +1,7 @@
 'use strict';
 
 const { parseBodyAsObject } = require('./body-utils');
+const { isModelEligible } = require('./model-eligibility');
 const { carryForwardCodexCompatibility } = require('./codex-compat');
 const {
   attemptKey,
@@ -18,6 +19,7 @@ const {
 } = require('./cross-provider-fallback');
 const { validateReasoningEffort } = require('./reasoning-effort-validation');
 const { sanitizeForLog } = require('./logging');
+const { mergeInjectedHeaders } = require('./request-headers');
 const {
   carryForwardWireApiCompatibility,
   endpointForPath,
@@ -25,9 +27,17 @@ const {
   translateCopilotWireApi,
 } = require('./wire-api-compat');
 const { createInvocationModelBudget } = require('./enclave-model-budget');
+const {
+  MAX_AUTOMATIC_RECOVERIES,
+  isAutomaticRecoveryEnabled,
+  recoveryRecords,
+  getAutomaticRecoveryCandidates,
+  protocolForUrl,
+} = require('./model-recovery');
 
 const invocationModelBudget = createInvocationModelBudget(
   process.env.AWF_ENCLAVE_AGENT_MODEL_BUDGET_SECRET,
+  { enforceInferenceEndpoints: process.env.AWF_ENCLAVE_AGENT_PROXY === '1' },
 );
 
 /**
@@ -87,14 +97,14 @@ function getRequestCancellation(req, res) {
   return cancellation;
 }
 
-function rebuildCopilotWireApiFallback(sourceBody, nextModel, req, upstreamPath) {
+function rebuildCopilotWireApiFallback(sourceBody, nextModel, req, upstreamPath, preserveEndpoint = false) {
   const requestedEndpoint = endpointForPath(req?.url);
   const parsed = parseBodyAsObject(sourceBody);
   if (!requestedEndpoint || !parsed || typeof parsed.model !== 'string') return null;
 
   parsed.model = nextModel;
   const nextSourceBody = Buffer.from(JSON.stringify(parsed), 'utf8');
-  const translated = translateCopilotWireApi(nextSourceBody, req.url);
+  const translated = preserveEndpoint ? null : translateCopilotWireApi(nextSourceBody, req.url);
   const compatibility = translated?.compatibility || {
     requestedEndpoint,
     upstreamEndpoint: requestedEndpoint,
@@ -142,7 +152,31 @@ function createSendUpstreamRequest({
   getProviderAdapter = null,
   modelBudget = invocationModelBudget,
 }) {
-  return function sendUpstreamRequest(requestHeaders, {
+  const failBrokerAuth = ({ res, req, provider, span }) => {
+    metrics.gaugeDec('active_requests', { provider });
+    otel.endSpan(span, 503);
+    if (res.headersSent || res.destroyed || res.writableEnded) return;
+    if (req.awfRouting) req.awfRouting.localError = { code: 'token_broker_unavailable', type: 'authentication_error' };
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { code: 'token_broker_unavailable', type: 'authentication_error',
+      message: 'Copilot token broker authentication unavailable' } }));
+  };
+
+  // Resolve renewable credentials immediately before each actual attempt,
+  // including model/endpoint retries. No refresh timer can touch active streams.
+  function sendUpstreamRequest(requestHeaders, ctx) {
+    const adapter = getProviderAdapter?.(ctx.provider);
+    if (!adapter?.renewableAuth) return dispatchUpstreamRequest(requestHeaders, ctx);
+    return adapter.getAuthHeaders({ method: ctx.req.method, url: ctx.upstreamPath, headers: ctx.req.headers })
+      .then(authHeaders => {
+        const headers = Object.fromEntries(Object.entries(requestHeaders)
+          .filter(([key]) => key.toLowerCase() !== 'authorization'));
+        mergeInjectedHeaders(headers, authHeaders, ctx.targetHost);
+        dispatchUpstreamRequest(headers, ctx);
+      }).catch(() => failBrokerAuth(ctx));
+  }
+
+  function dispatchUpstreamRequest(requestHeaders, {
     body, targetHost, upstreamPath, req, res, provider, requestId, startTime, span, requestBytes,
     requestSigner = null,
     hasRetried = false,
@@ -156,8 +190,9 @@ function createSendUpstreamRequest({
     fallbackOrigin = null,
     protocolTranslation = null,
   }) {
-    const isPermitted = isFallbackModelPermitted
-      ? (model, route) => isFallbackModelPermitted(model, route, req) : null;
+    const isPermitted = (model, route) =>
+      isModelEligible(model, route, req, { inputMode: 'native' }) &&
+      (!isFallbackModelPermitted || isFallbackModelPermitted(model, route, req));
     const cancellation = getRequestCancellation(req, res);
     cancellation.responseStarted = false;
     cancellation.onCancel = () => {
@@ -170,7 +205,7 @@ function createSendUpstreamRequest({
     if (cancellation.cancelled) return;
 
     try {
-      validateReasoningEffort(body, provider, upstreamPath);
+      validateReasoningEffort(body, provider, upstreamPath, req.awfRuntimePricing);
     } catch (err) {
       if (err.code !== 'unsupported_reasoning_effort') throw err;
       if (res.headersSent) return;
@@ -223,7 +258,7 @@ function createSendUpstreamRequest({
       wireApiCompatibility,
       wireApiSourceBody,
       wireApiEndpointRetryAttempted,
-      failures: [],
+      failures: req.awfModelFallback?.failures || [],
     };
 
     // Evaluate candidates only after an eligible failure so skipped-entry
@@ -231,11 +266,14 @@ function createSendUpstreamRequest({
     let onModelFallback = null;
     if (!isRoutingClassifier && !req.awfScopedAuto) {
       const chain = getFallbackModelsDep();
-      const current = chain.length > 0 ? getRequestModel(body, upstreamPath) : null;
+      const automaticRecovery = isAutomaticRecoveryEnabled(provider, req) &&
+        protocolForUrl(req.url) &&
+        recoveryRecords(provider, req).length > 0;
+      const current = chain.length > 0 || automaticRecovery ? getRequestModel(body, upstreamPath) : null;
       if (current) {
         const attempted = Array.isArray(attemptedModels) && attemptedModels.length > 0
           ? attemptedModels.map(a => toAttempt(a, provider))
-          : [{ provider, model: current.model }];
+          : req.awfRecoveryAttempts || [{ provider, model: current.model }];
         const getRouteRejection = (candidate) => {
           if (candidate.provider === provider || candidate.provider === origin.provider) return null;
           return getCrossProviderRejection({
@@ -244,7 +282,7 @@ function createSendUpstreamRequest({
             adapter: typeof getProviderAdapter === 'function' ? getProviderAdapter(candidate.provider) : null,
           });
         };
-        const select = (exclude, onSkip) => selectNextFallbackCandidate(chain, attempted, origin.provider, {
+        const select = (candidates, exclude, onSkip) => selectNextFallbackCandidate(candidates, attempted, origin.provider, {
           isPermitted,
           getRouteRejection,
           exclude,
@@ -263,6 +301,15 @@ function createSendUpstreamRequest({
               ...(statusCode !== null ? { status: statusCode } : {}),
             };
             const failures = [...origin.failures, failure];
+            const automaticModels = automaticRecovery &&
+              ['model_not_supported', 'model_endpoint_incompatible'].includes(reason) &&
+              (req.awfAutomaticRecoveryCount || (req.awfRecoveryAttempts ? 1 : 0)) < MAX_AUTOMATIC_RECOVERIES
+              ? getAutomaticRecoveryCandidates({
+                model: attempted[0].model, provider,
+                body: origin.sourceBody, url: req.url, req, isPermitted,
+              }).map(model => `${provider}/${model}`)
+              : [];
+            const candidates = [...chain, ...automaticModels];
             const exclude = new Set();
             const logSkip = (candidate, skipReason) => {
               logRequest?.('warn', 'model_fallback_skipped', {
@@ -279,8 +326,12 @@ function createSendUpstreamRequest({
             const recordFallback = (candidate) => {
               const requested = attempted[0];
               const attempt = attempted.length;
+              if (!chain.includes(candidate.entry)) {
+                req.awfAutomaticRecoveryCount = (req.awfAutomaticRecoveryCount ||
+                  (req.awfRecoveryAttempts ? 1 : 0)) + 1;
+              }
               req.awfModelFallback = {
-                requested_model: requested.model,
+                requested_model: sanitizeForLog(req.awfRequestedModelSelector || requested.model),
                 requested_provider: requested.provider,
                 model: candidate.model,
                 provider: candidate.provider,
@@ -291,15 +342,16 @@ function createSendUpstreamRequest({
                 from_provider: provider,
                 failures,
               };
+              req.awfRouting?.onModelFallback?.(req.awfModelFallback);
               if (typeof logRequest === 'function') {
                 logRequest('warn', 'model_fallback', {
                   request_id: requestId,
                   provider,
-                  from_model: current.model,
-                  to_model: candidate.model,
+                  from_model: sanitizeForLog(current.model),
+                  to_model: sanitizeForLog(candidate.model),
                   from_provider: provider,
                   to_provider: candidate.provider,
-                  requested_model: requested.model,
+                  requested_model: sanitizeForLog(req.awfRequestedModelSelector || requested.model),
                   requested_provider: requested.provider,
                   attempt,
                   reason,
@@ -331,7 +383,9 @@ function createSendUpstreamRequest({
               if (!rewritten) return null;
               let wireFallback = null;
               if (provider === 'copilot' && wireApiSourceBody) {
-                wireFallback = rebuildCopilotWireApiFallback(wireApiSourceBody, candidate.model, req, upstreamPath);
+                wireFallback = rebuildCopilotWireApiFallback(
+                  wireApiSourceBody, candidate.model, req, upstreamPath, !chain.includes(candidate.entry),
+                );
               }
               const retryBody = wireFallback?.body || rewritten.body;
               return () => sendUpstreamRequest(
@@ -367,7 +421,9 @@ function createSendUpstreamRequest({
               if (!rewritten) return null;
               let wireFallback = null;
               if (origin.provider === 'copilot' && origin.wireApiSourceBody) {
-                wireFallback = rebuildCopilotWireApiFallback(origin.wireApiSourceBody, candidate.model, req, origin.upstreamPath);
+                wireFallback = rebuildCopilotWireApiFallback(
+                  origin.wireApiSourceBody, candidate.model, req, origin.upstreamPath, !chain.includes(candidate.entry),
+                );
               }
               const retryBody = wireFallback?.body || rewritten.body;
               return () => sendUpstreamRequest(rebuildBodyFramingHeaders(origin.requestHeaders, retryBody.length), {
@@ -391,7 +447,7 @@ function createSendUpstreamRequest({
             };
 
             const giveUp = () => {
-              if (typeof abandon === 'function') {
+              if (!(automaticRecovery && reason === 'model_not_supported') && typeof abandon === 'function') {
                 abandon();
                 return;
               }
@@ -419,7 +475,7 @@ function createSendUpstreamRequest({
             const tryCandidates = () => {
               for (;;) {
                 if (cancellation.cancelled) return false;
-                const candidate = select(exclude, logSkip);
+                const candidate = select(candidates, exclude, logSkip);
                 if (!candidate) return false;
                 const key = attemptKey(candidate.provider, candidate.model);
                 if (candidate.provider === provider || candidate.provider === origin.provider) {
@@ -490,6 +546,10 @@ function createSendUpstreamRequest({
                     finalizeCancellation();
                     return;
                   }
+                  if (err?.code === 'token_broker_unavailable') {
+                    failBrokerAuth({ res, req, provider, span });
+                    return;
+                  }
                   exclude.add(key);
                   logSkip(candidate, err?.code === 'unsupported_protocol_feature' || err?.code === 'unsupported_wire_api_feature'
                     ? `protocol_translation_failed: ${err.feature || err.message}`
@@ -505,6 +565,10 @@ function createSendUpstreamRequest({
             };
 
             if (tryCandidates()) return true;
+            if (automaticRecovery && reason === 'model_not_supported') {
+              giveUp();
+              return true;
+            }
             return false;
           };
         }
@@ -611,14 +675,15 @@ function createSendUpstreamRequest({
       }
     }
 
-    // Honor an explicit http:// target scheme (see proxy-utils.js normalizeApiTarget)
-    // by dialing the upstream in cleartext on port 80 instead of always assuming
-    // HTTPS on 443. Bare hostnames and explicit https:// targets both default to
-    // 'https', matching prior behavior.
+    // Keep the authority intact for Host headers/signing, but dial hostname and
+    // port separately (including for IPv6 literals).
     const isHttp = targetScheme === 'http';
     const mod = isHttp ? http : https;
+    const targetUrl = new URL(`${targetScheme}://${targetHost}`);
     const options = {
-      hostname: targetHost, port: isHttp ? 80 : 443, path: upstreamPath,
+      hostname: targetUrl.hostname.replace(/^\[|\]$/g, ''),
+      port: targetUrl.port ? Number(targetUrl.port) : (isHttp ? 80 : 443),
+      path: upstreamPath,
       method: req.method, headers: outboundHeaders,
       agent: proxyAgent,
       signal: cancellation.controller.signal,
@@ -631,6 +696,11 @@ function createSendUpstreamRequest({
         return;
       }
       responded = true;
+      const adapter = getProviderAdapter?.(provider);
+      if (adapter?.renewableAuth) {
+        if (proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) adapter.recordAuthReadiness?.(true);
+        else if (proxyRes.statusCode === 401 || proxyRes.statusCode === 403) adapter.recordAuthReadiness?.(false);
+      }
       cancellation.responseStarted = true;
       handleUpstreamResponse(proxyRes, outboundHeaders, {
         body, res, provider, requestId, req, targetHost, upstreamPath, startTime, span, requestBytes,
@@ -759,6 +829,13 @@ function createSendUpstreamRequest({
           const newParsed = parseBodyAsObject(body);
           if (!newParsed) return false;
           newParsed.model = nextModel;
+          req.awfRouting?.onModelFallback?.({
+            requested_model: req.awfRequestedModelSelector || currentModel,
+            model: nextModel,
+            provider,
+            from_model: currentModel,
+            reason: 'model_endpoint_incompatible',
+          });
           const newBody = wireFallback?.body || Buffer.from(JSON.stringify(newParsed), 'utf8');
           const retryPath = wireFallback?.upstreamPath || upstreamPath;
           const retryHeaders = rebuildBodyFramingHeaders(requestHeaders, newBody.length);
@@ -815,7 +892,8 @@ function createSendUpstreamRequest({
 
     if (body.length > 0) proxyReq.write(body);
     proxyReq.end();
-  };
+  }
+  return sendUpstreamRequest;
 }
 
 module.exports = {

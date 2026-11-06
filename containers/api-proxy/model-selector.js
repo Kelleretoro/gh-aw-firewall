@@ -2,6 +2,8 @@
 
 const { stripRedundantProviderPrefix } = require('./model-utils');
 const { resolveModel } = require('./model-resolver');
+const { findAvailableModel, resolveModelIdentity } = require('./model-identity');
+const { getModelEligibilityScope, evaluateModelEligibility } = require('./model-eligibility');
 
 function selectorError(selector, provider, reason) {
   const error = new Error(
@@ -17,15 +19,26 @@ function selectorError(selector, provider, reason) {
   return error;
 }
 
-function modelSelection(id, suffix) {
+function modelSelection(id, suffix, provider, requestedModel, eligibilityRequest) {
   const resolvedModel = id + suffix;
-  return { resolvedModel, candidates: [resolvedModel], log: [] };
+  const scope = getModelEligibilityScope(provider, eligibilityRequest);
+  const resolved = resolveModelIdentity(id, provider, { scope, policy: { providerPrefix: false } });
+  const requested = resolveModelIdentity(requestedModel, provider, { scope });
+  return {
+    resolvedModel, candidates: [resolvedModel], log: [],
+    eligibilityDecision: evaluateModelEligibility(id, provider, eligibilityRequest, { inputMode: 'native' }),
+    identity: resolved.identity, wireId: id,
+    matchKind: requested.identity?.key === resolved.identity?.key ? requested.matchKind : 'selector',
+    requestedModel,
+    aliasKeys: [],
+  };
 }
 
-function resolveAliasSelection(selector, aliasKey, provider, ids, aliases, suffix, modelPolicy, qualified, base, isModelPriceable) {
+function resolveAliasSelection(selector, aliasKey, provider, ids, aliases, suffix, modelPolicy, qualified, base, eligibilityRequest) {
   if (!aliasKey || (!qualified && !/\s/.test(base))) return null;
   const resolveAlias = policy => resolveModel(
-    aliasKey, aliases, { [provider]: ids }, provider, [], { enabled: false, isModelPriceable }, policy,
+    aliasKey, aliases, { [provider]: ids }, provider, [], { enabled: false }, policy,
+    true, { blocked: false }, eligibilityRequest,
   );
   const resolution = resolveAlias(modelPolicy) || (modelPolicy && resolveAlias(null));
   if (resolution && ids.includes(resolution.resolvedModel)) {
@@ -43,7 +56,7 @@ function resolveAliasSelection(selector, aliasKey, provider, ids, aliases, suffi
  * Unknown API/deployment IDs remain provider-local; UI selectors never use
  * family-version or middle-power fallback and are never synthesized.
  */
-function resolveModelSelector(selector, provider, modelIds, records, aliases = {}, modelPolicy = null, isModelPriceable = null) {
+function resolveModelSelector(selector, provider, modelIds, records, aliases = {}, modelPolicy = null, eligibilityRequest) {
   if (Array.isArray(selector)) {
     throw selectorError(selector, provider, 'prioritized lists belong to the consuming surface');
   }
@@ -54,13 +67,13 @@ function resolveModelSelector(selector, provider, modelIds, records, aliases = {
     queryIndex < 0 ? selector : selector.slice(0, queryIndex), provider,
   );
   const ids = (modelIds || []).filter(id => typeof id === 'string');
-  const direct = ids.find(id => id.toLowerCase() === base.toLowerCase());
+  const direct = findAvailableModel(base, provider, ids, { scope: getModelEligibilityScope(provider, eligibilityRequest) });
   // Check IDs before interpreting punctuation: deployment names are arbitrary.
-  if (direct) return modelSelection(direct, suffix);
+  if (direct) return modelSelection(direct, suffix, provider, selector, eligibilityRequest);
 
   const exactAliasKey = Object.keys(aliases).find(key => key.toLowerCase() === base.toLowerCase());
   const exactAlias = resolveAliasSelection(
-    selector, exactAliasKey, provider, ids, aliases, suffix, modelPolicy, false, base, isModelPriceable,
+    selector, exactAliasKey, provider, ids, aliases, suffix, modelPolicy, false, base, eligibilityRequest,
   );
   if (exactAlias) return exactAlias;
 
@@ -72,7 +85,7 @@ function resolveModelSelector(selector, provider, modelIds, records, aliases = {
   if (fullNameMatches.length > 1) {
     throw selectorError(selector, provider, 'the advertised display name is ambiguous; use a canonical ID');
   }
-  if (fullNameMatches.length === 1) return modelSelection(fullNameMatches[0], suffix);
+  if (fullNameMatches.length === 1) return modelSelection(fullNameMatches[0], suffix, provider, selector, eligibilityRequest);
 
   const qualified = base.match(/^(.+) \(([^()]+)\)$/);
   const name = qualified ? qualified[1] : base;
@@ -82,12 +95,12 @@ function resolveModelSelector(selector, provider, modelIds, records, aliases = {
     throw error;
   }
   const qualifiedId = qualified && ids.find(id => id.toLowerCase() === name.toLowerCase());
-  if (qualifiedId) return modelSelection(qualifiedId, suffix);
+  if (qualifiedId) return modelSelection(qualifiedId, suffix, provider, selector, eligibilityRequest);
 
   const aliasKey =
     (qualified && Object.keys(aliases).find(key => key.toLowerCase() === name.toLowerCase()));
   const aliasSelection = resolveAliasSelection(
-    selector, aliasKey, provider, ids, aliases, suffix, modelPolicy, Boolean(qualified), base, isModelPriceable,
+    selector, aliasKey, provider, ids, aliases, suffix, modelPolicy, Boolean(qualified), base, eligibilityRequest,
   );
   if (aliasSelection) return aliasSelection;
 
@@ -100,7 +113,7 @@ function resolveModelSelector(selector, provider, modelIds, records, aliases = {
   if (matches.length > 1) {
     throw selectorError(selector, provider, 'the advertised display name is ambiguous; use a canonical ID');
   }
-  if (matches.length === 1) return modelSelection(matches[0], suffix);
+  if (matches.length === 1) return modelSelection(matches[0], suffix, provider, selector, eligibilityRequest);
   if (qualified || /\s/.test(base)) {
     throw selectorError(selector, provider, Array.isArray(modelIds)
       ? 'no advertised display name matches'

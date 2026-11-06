@@ -6,6 +6,222 @@ Maintainers still approve changes by merging to `main`. No publication command,
 manual dispatch, data tag, package version bump, or container release is needed
 after that merge.
 
+## Bundled naming versus remotely refreshed pricing
+
+Reviewed canonical source records own model identities, scoped identity aliases,
+and family exceptions. `npm run models:generate` projects those naming facts into
+bundled host/proxy assets; `npm run models:check` rejects drift. Request resolution
+uses the canonical matching implementation with an explicit scope and matching
+policy. Discovery still supplies executable models and their upstream wire IDs:
+neither a bundled identity nor a published tariff establishes availability.
+
+Identity aliases are not operator routing aliases. Existing recursive/glob
+`apiProxy.models` expressions, loop detection, parameter suffixes, direct-ID
+precedence, and configured fallback remain separate. Request matching retains
+case-insensitive IDs and redundant-current-provider prefixes; separator folding
+and date stripping are not globally enabled. Host CLI separator equivalence is
+an explicit compatibility policy, not a proxy-wide normalization rule.
+
+The named compatibility corrections are rejection of ambiguous case-insensitive
+routing aliases, exclusion of retired alias/fallback targets, and protection of
+specialized variants from implicit GPT minor-version family capture. A request
+for a specialized ID no longer falls through the implicit `gpt-5` routing alias,
+and bare GPT version fallback no longer picks a specialized variant. Explicit
+operator glob expressions and configured automatic fallback remain opt-in paths;
+family rules annotate identity without authorizing substitutions.
+
+Publication v1 identities contain only `key`, `provider`, `rawId`, and `lookupId`.
+Its strict schema does not transport alias/family rules. An authenticated,
+request-pinned pricing refresh can associate scoped tariffs with the resolved
+provider-qualified identity, but cannot rename requests, switch providers, add
+executable models, or update bundled naming. Existing pricing authority,
+field-level precedence, freshness, provenance, and accounting remain unchanged.
+Old v1 snapshots remain valid; remote naming would require a separately reviewed,
+versioned contract.
+
+This is not completion of the eligibility/compiler migration. Workflow overlays,
+execution-environment detection, and the remaining Phase 4 and broader
+pricing/eligibility work remain under #10294 and #10290 (including the companion
+compiler integration in github/gh-aw#70728).
+
+## Active canonical fallback pricing
+
+The shared pricing resolver now receives maintained fallback rates from
+`model-information.pricing.generated.json`, not `ai-credits-pricing.js`.
+`scripts/model-information/compile.cjs` derives that projection from the active
+`shared/model-information/sources/copilot-*.json` records. It also generates
+`model-information.fallback-pricing.generated.json` from the governed import and
+the explicit native compatibility associations in `sources/pricing-reference.json`.
+The existing `catalogue-pricing.js` adapter consumes both assets in Docker and npm
+distributions. There is no new runtime loader or independently authored price
+table. Historical adapters remain for unrelated consumers.
+
+The authority order remains operator override, configured catalogue v1, complete
+fresh provider observation, applicable fresh central snapshot, maintained
+fallback, governed scoped import, then explicit selector/default/sentinel policy.
+Partial-provider component merging, central BYOK/channel/deployment exclusions,
+strict context thresholds, request/connection captures and revision pinning are
+unchanged. Remote refresh cannot change bundled names, source associations,
+availability or the executing backend.
+
+The maintained projection retains **all 42 Copilot rates and both long-context
+tiers unchanged**. Native API compatibility preserves nine OpenAI and seven
+Anthropic model associations: the original 12-model reference plus the four
+explicit historical guard fixtures (`gpt-5-mini`, `gpt-5.4`,
+`claude-sonnet-4-6`, `claude-opus-4-7`). These are labeled
+`legacy_native_compatibility`, `authority: policy`, `confidence: policy_fallback`,
+not independently verified current native tariffs. The original source
+provenance is retained; test dates do not refresh billing evidence. Source labels
+`curated` and `models.dev` remain compatible, with catalogue revisions attached;
+native compatibility usage also records the policy as its catalogue ID.
+
+The pinned raw import has 455 rows, of which 429 are accepted and 26 rejected by
+the governed importer. They apply only to pricing-provider identity `openrouter`
+with full native wire IDs such as `anthropic/claude-sonnet-5.5`.
+`anthropic` is the publisher namespace here, **not** the serving backend.
+An OpenRouter price cannot price a native Anthropic/OpenAI call, a Copilot call,
+an arbitrary compatible/custom backend or an omitted provider. A pricing-provider
+identity does not require a runtime adapter or establish execution support.
+
+Within an applicable namespace, raw exact IDs win before the import's historical
+separator/date normalization. Namespaces themselves match exactly; ambiguous
+normalized matches produce the existing sanitized resolution error. This
+normalization is local to pricing, not a global naming/routing policy. Unreviewed
+`canonical_slug` aliases are not imported as identities: 39 distinct aliases
+associated with accepted rows no longer resolve in this pinned snapshot after
+the retained normalization. For example, `openai/gpt-4-turbo:batch` remains priced,
+but its `canonical_slug` cannot assign that batch price to `openai/gpt-4-turbo`.
+
+### Explicit charge and coverage changes
+
+For the 429 exact qualified OpenRouter IDs, 426 default four-component rate
+vectors are unchanged. The following three change; two additional models stop
+inheriting another backend's long-context tiers. Prices below are USD per million
+tokens, and one AI credit remains USD 0.01.
+
+| OpenRouter wire ID | Previous fallback | Active scoped import |
+| --- | --- | --- |
+| `openai/gpt-4o-2024-05-13` | Bare/date-folded collision: input 2.5, cached input 1.25, output 10 | Exact dated ID: input 5, cached input 0.5, output 15. One million fresh input plus one million output changes from 1,250 to 2,000 credits. |
+| `google/gemini-2.5-pro` | Curated cache write unavailable: zero cache-write charge | Imported cache write 0.375: 37.5 credits per million cache-write tokens. |
+| `google/gemini-3.5-flash` | Curated cache write unavailable: zero cache-write charge | Imported cache write 0.0833333333333333: 8.333333 credits per million cache-write tokens after existing response rounding. |
+| `anthropic/claude-haiku-5.5`, above 100,000 prompt tokens | Copilot long tier: input 0.5, cached input 0.05, cache write 0.625, output 2.5 | Imported flat rates: 0.1, 0.01, 0.125, 0.5 respectively. At 100,001 fresh input tokens: 5.00005 to 1.00001 credits. |
+| `openai/gpt-6.1-sol`, above 272,000 prompt tokens | Copilot long tier: input 4, cached input 0.2, cache write 5, output 15 | Imported flat rates: 2, 0.1, 2.5, 10 respectively. At 272,001 fresh input tokens: 108.8004 to 54.4002 credits. |
+
+These are intentional source-scope corrections, not new verified native tariffs.
+Copilot's tiers and the explicit native compatibility policy retain their rates
+and exact boundaries. No `target.json` tariff, promotion or successor is activated.
+Future OpenRouter tier support requires governed upstream evidence, not borrowing
+the Copilot tier. Missing imported cache-read prices retain the explicit legacy
+10%-of-input policy; missing cache-write prices remain null. Explicit zero prices
+remain zero. Missing/null required input or output prices are rejected, not free.
+Out-of-bound imported decimals fail explicitly rather than underflowing to free.
+
+Native/custom requests outside the explicit associations, and requests that
+previously borrowed another backend's same-slug price, may now be unpriced.
+Concrete requests without exact/default pricing now warn and use the exact
+per-component median of applicable same-backend declared-family tariffs, or
+the backend-wide median when no family donors exist. These accounting estimates
+contribute to credits and budgets; only a backend with no eligible donors remains
+unpriced/excluded, with an explicit undercount warning. See
+[missing model pricing](awf-config-spec.md#1033-missing-model-pricing-warnings)
+for donor, optional-component and provenance semantics. Use an explicit
+operator/configured tariff or configured default for verified rates. Price coverage is
+not execution admission. Existing recovery, opt-outs, dynamic-selector ceilings,
+unknown-sentinel fallback, budget guards and accounting-error dispatch blocking
+remain active.
+
+The provider-free `scripts/ci/smoke-pricing-resolution.cjs` runs from the off-tree
+Docker application layout and extracted npm package, both with shipped data and
+with changed maintained rates and additional test imports passed through the
+real canonical compiler. The changed rates must change HTTP/WebSocket charges
+without editing the historical table. It
+checks actual HTTP/WebSocket charges and budgets, overriding sources, native and
+custom/OpenRouter scope, same-slug namespaces, exact/date precedence, ambiguity,
+strict tier boundaries, missing/null/zero prices, explicit charge deltas and
+refresh pins. Every run prohibits network access and requires zero network calls.
+This does not run live inference, a workflow, a container or a VM.
+
+Generalized assembled tariffs, promotions/successors,
+non-token charges, broader export/reasoning migrations and harness/compiler/VM
+changes remain outside this slice. This is not completion of #10295 or #10290.
+
+## Exact-decimal accounting
+
+Active accounting uses `shared/model-information/exact-pricing.js`, shipped by
+the existing compiler into both contract distributions. Decimal source strings
+remain exact in maintained projections, governed imports, central tariffs and
+operator/configured/default prices. Provider AIU/nano-AIU and batch-size
+conversions, and the explicit missing-cache 10% policy, use exact rational
+arithmetic. Rational denominators also preserve provider batches such as three
+tokens without truncating a repeating decimal. No price evidence, source scope,
+authority order or staged tariff is changed.
+
+The shared resolver carries private exact rates alongside compatible numeric
+rate views. Tier selection and partial-provider component merging preserve those
+rates. HTTP and WebSocket token tracking feed the same exact token multiplication,
+reasoning/cache split, component summation, per-model buckets and process total.
+Request/connection runtime captures explicitly copy private rates; refreshes
+cannot reprice an in-flight response. Additive Anthropic/precise Copilot input and
+total-inclusive OpenAI-style input retain their existing cache semantics.
+Missing prices still warn and exclude usage, not fabricate free coverage or
+change execution admission. Null cache-write prices remain unavailable; explicit
+zero remains supplied zero.
+
+Only output projections round: response credits, `/reflect` totals and per-model
+components, usage/budget logs and JSONL, telemetry and `AWF_AI_CREDITS_USED` keep
+their existing numeric/string types and six decimal places. Exact nonnegative
+ties round upward: exactly `0.0000005` credits displays as `0.000001`; an
+arbitrarily close supported decimal below it displays as zero. `/reflect`
+percent-used keeps its ceiling clamp and two decimal places. No BigInt or
+internal rational is serialized. Numeric rate/limit views remain binary Numbers
+and may display a rounded boundary (or zero for a sub-Number-range value); they
+are never read back into accounting. Logs/env remain output snapshots, not an
+exact ledger for restarting a process.
+
+Budget, the fixed 10,000-credit hard cap, and 80/90/95/99% steering compare the
+**unrounded accumulated charge** against exact thresholds; equality exhausts the
+budget. Previously, a total of `0.9999996` could display as one and prematurely
+exhaust a one-credit budget. It now remains below budget. At exactly one credit
+the guard blocks, regardless of accumulation order. One thousand one-token
+responses at USD `0.0001` per million tokens each display zero but together
+consume exactly `0.00001` credits, as does a single thousand-token response.
+Sub-output-unit charges are never discarded before addition.
+
+Precision and failure boundaries are explicit:
+
+- Legacy/config/provider **Number** inputs preserve only `String(value)`, not
+  their original JSON spelling or precision already lost by upstream parsing.
+  Existing host numeric config schemas are unchanged. Decimal strings at the
+  supported proxy pricing boundaries preserve their supplied precision.
+- Parsing accepts nonnegative decimal/scientific strings with at most 400
+  mantissa digits, 420 total characters and an absolute decimal exponent after
+  accounting for fractional places of at most 400. Exponent text has at most
+  three digits. Surrounding whitespace, a leading plus and omitted integer or
+  fractional digits around a decimal point retain decimal compatibility. Hex,
+  negative/nonfinite values, malformed values
+  and larger representations are not approximated. Positive tiny supported
+  rates remain chargeable even when their numeric view underflows.
+- Rational numerator/denominator intermediates are bounded to 4,096 decimal
+  digits; usage counts must be nonnegative safe integers. Unrepresentable
+  numeric outputs or exhausted arithmetic bounds fail explicitly. Invalid
+  supplied operator rates now error instead of silently falling through to a
+  lower-priority source. Existing absent/nonpositive/invalid-limit opt-outs and
+  the hard cap remain; syntactically decimal but out-of-bound limits error.
+- Selected-tariff/arithmetic failures use sanitized `pricing_resolution_error`
+  logging and responses and latch subsequent HTTP/WebSocket dispatch blocking.
+  No approximate, legacy or free-price fallback is used after such a failure.
+  Malformed provider observations remain explicit invalid facts across discovery
+  and refresh, rather than being swallowed as fetch failures or replaced by an
+  older tariff. Existing valid in-flight captures remain pinned.
+
+Provider-free tests exercise long decimal maintained/imported compiler fixtures,
+central and runtime pins, overrides, fractional batch conversions, exact
+below/equal/above budgets/hard caps/steering, rounding ties, cache/reasoning splits,
+many tiny HTTP/WebSocket responses and explicit failures. The same smoke script
+runs against off-tree Docker application files and the extracted npm package,
+with zero network calls enforced. This is an authoritative arithmetic change,
+not a shadow/waiting phase, and does not complete #10295 or #10290.
+
 ## Automatic publication
 
 `.github/workflows/publish-model-catalogue.yml` is an ordinary deterministic
@@ -355,8 +571,8 @@ those fixtures do **not** substitute for a successful approved live Actions run.
 ### Bounded rollout
 
 This integration ships the publication consumer and its automated authenticity
-gate, not all Gate 5/8 criteria. Generated retired/mapping readers and legacy
-bundled pricing paths remain active. Governed OpenRouter imports, staged model
+gate, not all Gate 5/8 criteria. Generated retired/mapping readers and the active
+canonical pricing fallbacks described above are enabled. Staged target model
 facts, full pricing/eligibility consolidation, cross-repository configuration
 handoff and the broader export/compatibility phases are not activated. See
 [ADR 0004](adr/0004-model-information-management.md),

@@ -1,5 +1,6 @@
 ---
 description: Weekly documentation review with a 7-day change gate and 48-hour agent context
+runs-on: ubuntu-24.04
 on:
   schedule: weekly
   workflow_dispatch:
@@ -53,7 +54,7 @@ jobs:
             echo "skip_agent=$SKIP_AGENT"
           } >> "$GITHUB_OUTPUT"
 max-turns: 60
-model: claude-haiku-4.5
+model: auto
 engine:
   id: copilot
 tools:

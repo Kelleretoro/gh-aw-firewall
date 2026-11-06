@@ -5,6 +5,7 @@ import { parseImageTag } from '../image-tag';
 import type { WrapperConfig } from '../types';
 import { buildEnclaveMcpService, resolveEnclaveAgentApiPort } from './enclave-mcp-service';
 import { generateDockerCompose } from '../compose-generator';
+import * as hostIdentity from '../host-identity';
 import {
   ENCLAVE_AGENT_API_PROXY_IP,
   ENCLAVE_AGENT_EGRESS_NETWORK,
@@ -85,6 +86,26 @@ function githubToolsEnclaves() {
 }
 
 describe('unified enclave agent executor compose assembly', () => {
+  it('never applies the primary harness observation to a dedicated enclave proxy', () => {
+    const env = build({ agentCommand: 'copilot --model primary' }).agentApiProxyService?.environment;
+    expect(env).toBeDefined();
+    expect(env).not.toHaveProperty('AWF_HARNESS_ENVIRONMENT');
+    expect(env).not.toHaveProperty('AWF_SELECTED_HARNESS');
+    expect(env).not.toHaveProperty('AWF_HARNESS_BINARY');
+  });
+
+  it('uses the runner UID/GID for enclave API proxy shared log writes on ARC/DinD', () => {
+    const uid = jest.spyOn(hostIdentity, 'getSafeHostUid').mockReturnValue('12345');
+    const gid = jest.spyOn(hostIdentity, 'getSafeHostGid').mockReturnValue('23456');
+    try {
+      expect(build({ runnerTopology: 'arc-dind', dockerHostPathPrefix: '/tmp' }).agentApiProxyService)
+        .toMatchObject({ user: '12345:23456' });
+    } finally {
+      uid.mockRestore();
+      gid.mockRestore();
+    }
+  });
+
   it('pins the published enclave-agent image and its one-shot pull service', () => {
     const result = build();
     expect(result.toolchainImageService).toBeUndefined();

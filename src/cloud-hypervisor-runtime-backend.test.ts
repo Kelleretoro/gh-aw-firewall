@@ -8,6 +8,7 @@ import * as enclaveLifecycle from './enclave/cloud-hypervisor-lifecycle';
 import * as runtimeValidation from './cloud-hypervisor/runtime-validation';
 import { normalizeEnclavesConfig } from './parsers/enclave-parser';
 import { runCloudHypervisorPreflight } from './cloud-hypervisor/preflight';
+import { withInputPreflight } from './input-preflight';
 import {
   cloudHypervisorRuntimeTestHelpers,
   createCloudHypervisorRuntimeBackend,
@@ -174,6 +175,68 @@ async function startNestedKvmProbeCase() {
 }
 
 describe('Cloud Hypervisor runtime backend', () => {
+  it('captures a bounded version probe in the ready guest with the actual command identity and environment', async () => {
+    const { manager, deps } = harness();
+    const backend = createBackend(config(), deps);
+    await expect(backend.probeHarness!('probe')).rejects.toThrow('not ready');
+    await backend.start('/tmp/awf', ['github.com']);
+    manager.execute.mockReset().mockImplementationOnce(async request => {
+      request.stdout.write('/guest/copilot\n1.2.3\n');
+      request.stderr.write('Bearer discarded');
+      return { requestId: request.requestId, exitCode: 0, signal: null, timedOut: false };
+    }).mockResolvedValueOnce({ requestId: 'agent', exitCode: 23, signal: null, timedOut: false });
+    expect(await backend.probeHarness!('probe')).toMatchObject({
+      stdout: '/guest/copilot\n1.2.3\n', exitCode: 0, timedOut: false, overflow: false,
+    });
+    await backend.exec('/tmp/awf', []);
+    const probe = manager.execute.mock.calls[0][0];
+    const execution = manager.execute.mock.calls[1][0];
+    expect(probe).toMatchObject({
+      argv: ['/bin/sh', '-lc', 'probe'], timeoutMs: 10_000,
+      cwd: execution.cwd, uid: execution.uid, gid: execution.gid, tty: false,
+      auditOutput: false,
+    });
+    expect(probe.env).toBe(execution.env);
+    expect((deps.stderr as PassThrough).read()).toBeNull();
+    await backend.stop();
+    await expect(backend.probeHarness!('probe')).rejects.toThrow('not ready');
+  });
+
+  it('classifies guest probe timeout and output overflow without retaining stderr', async () => {
+    const { manager, deps } = harness();
+    const backend = createBackend(config(), deps);
+    await backend.start('/tmp/awf', []);
+    manager.execute.mockReset().mockImplementation(async request => {
+      request.stdout.write('x'.repeat(100_000));
+      request.stderr.write('secret');
+      return { requestId: request.requestId, exitCode: 124, signal: null, timedOut: true };
+    });
+    const result = await backend.probeHarness!('probe');
+    expect(result).toMatchObject({ timedOut: true, overflow: true, exitCode: 124 });
+    expect(Buffer.byteLength(result.stdout)).toBe(4097);
+    await backend.stop();
+  });
+
+  it('cancels the selected-harness probe before cleanup without entering the agent command', async () => {
+    const { manager, deps } = harness();
+    const backend = createBackend(config(), deps);
+    await backend.start('/tmp/awf', []);
+    let finish!: (result: ExecutionResult) => void;
+    manager.execute.mockReset().mockImplementationOnce(() => new Promise<ExecutionResult>(resolve => {
+      finish = resolve;
+    }));
+    manager.cancel.mockImplementationOnce(async () => {
+      finish({ requestId: 'harness', exitCode: 143, signal: null, timedOut: false });
+    });
+    const probe = backend.probeHarness!('probe');
+    await backend.stop();
+    await expect(probe).resolves.toMatchObject({ stdout: '', exitCode: 143, timedOut: false });
+    expect(manager.cancel).toHaveBeenCalledWith('AWF cleanup', expect.stringMatching(/^harness-/));
+    expect(manager.execute).toHaveBeenCalledTimes(1);
+    expect(manager.stop).toHaveBeenCalledWith({ preserve: false });
+    expect(deps.removeArtifactSnapshot).toHaveBeenCalledWith('/snapshot');
+    await expect(backend.exec('/tmp/awf', [])).rejects.toThrow('not ready');
+  });
   let eligibilitySpy: jest.SpyInstance;
 
   beforeEach(() => {
@@ -183,6 +246,20 @@ describe('Cloud Hypervisor runtime backend', () => {
 
   afterEach(() => {
     eligibilitySpy.mockRestore();
+  });
+
+  it('passes input preflight to the guest execution request under the workload identity', async () => {
+    const backendConfig = config({ inputDirs: ['/workspace/inputs'] });
+    const { deps, manager } = harness();
+    const backend = createBackend(backendConfig, deps);
+    await backend.start('/tmp/awf', ['github.com']);
+    await backend.exec('/tmp/awf', ['github.com']);
+    expect(manager.execute).toHaveBeenNthCalledWith(3, expect.objectContaining({
+      argv: ['/bin/sh', '-lc', withInputPreflight(backendConfig.agentCommand, backendConfig.inputDirs)],
+      uid: 1000,
+      gid: 1000,
+    }));
+    await backend.stop();
   });
 
   it('publishes primary preflight phase/profile through the real runtime caller', async () => {

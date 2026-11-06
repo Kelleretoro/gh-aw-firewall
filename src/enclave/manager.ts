@@ -50,6 +50,7 @@ import { ProductionTrustedCloudHypervisorEnclaveStorageProvider } from '../cloud
 import {
   assertDockerEnclaveLifecycleReady,
   assertDockerEnclaveHostPrerequisites,
+  resolveDockerEnclavePaths,
   isDockerEnclaveSelected,
   startDockerEnclaveLifecycle,
   stopDockerEnclaveLifecycle,
@@ -58,6 +59,10 @@ import { HOST_EXECUTOR_STORAGE_ROOT } from './host-executor-journal';
 import * as path from 'path';
 import { updateEnclaveStartupProgress } from './startup-progress';
 import { HostPreflightReporter } from '../cloud-hypervisor/host-preflight-progress';
+import {
+  getStaticGithubExecutorCapability,
+  takeStaticGithubExecutorCapability,
+} from './static-github-handoff';
 
 export const ENCLAVE_RUN_LABEL = 'awf.enclave.run';
 export function isEnclaveScriptEnabled(config: WrapperConfig): boolean {
@@ -165,6 +170,8 @@ export async function prepareEnclaves(
   updateEnclaveStartupProgress(config, { stage: 'configuration' });
   const enclaves = config.enclaves!;
   const env = deps.env ?? process.env;
+  takeStaticGithubExecutorCapability(config, env);
+  const staticGithubCapability = getStaticGithubExecutorCapability(config);
   const storageProvider = deps.cloudHypervisorStorageProvider ??
     new ProductionTrustedCloudHypervisorEnclaveStorageProvider();
   // Take custody of the compiler's AWF-only delegation handoff before anything
@@ -211,7 +218,7 @@ export async function prepareEnclaves(
   if (seedStagingRequired && !token) {
     errors.push('enclaves require a staging credential in GH_TOKEN or GITHUB_TOKEN on the AWF host');
   }
-  const githubAgentId = env[ENCLAVE_GITHUB_MCP_AGENT_ID_ENV] ?? '';
+  const githubAgentId = staticGithubCapability?.agentId ?? env[ENCLAVE_GITHUB_MCP_AGENT_ID_ENV] ?? '';
   if (isEnclaveGithubEnabled(config)) {
     if (!/^[A-Za-z0-9_-]{32,128}$/.test(githubAgentId)) {
       errors.push(
@@ -243,7 +250,7 @@ export async function prepareEnclaves(
   }
   updateEnclaveStartupProgress(config, { stage: 'host-preflight' });
   if (hostExecutorSelected) {
-    const hostPaths = resolveEnclavePaths(config.workDir);
+    const hostPaths = dockerSelected ? resolveDockerEnclavePaths(config.workDir) : resolveEnclavePaths(config.workDir);
     const report = cloudHypervisorSelected
       ? new HostPreflightReporter('host-isolation', (hostPreflight) =>
         updateEnclaveStartupProgress(config, { hostPreflight }))
@@ -354,8 +361,10 @@ export async function prepareEnclaves(
     writeExclusive(paths.capabilityPath, `${env[ENCLAVE_MCP_CAPABILITY_ENV]}\n`, 0o600));
   if (isEnclaveGithubEnabled(config)) {
     await storageChecks.check('github-identity', () => {
-      writeExclusive(paths.githubAgentIdPath, `${githubAgentId}\n`, 0o600);
-      if (env === process.env) delete process.env[ENCLAVE_GITHUB_MCP_AGENT_ID_ENV];
+      if (!staticGithubCapability) {
+        writeExclusive(paths.githubAgentIdPath, `${githubAgentId}\n`, 0o600);
+        if (env === process.env) delete process.env[ENCLAVE_GITHUB_MCP_AGENT_ID_ENV];
+      }
     });
   }
   if (dynamicDeclared && delegationHandoff.handoff) {

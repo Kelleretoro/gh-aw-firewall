@@ -68,6 +68,24 @@ export function generatePolicyManifest(config: SquidConfig): PolicyManifest {
   // even though port 8080 is not in Safe_ports. This mirrors the rule ordering
   // in generateSquidConfig / generateTopologyPeersSection.
   addTopologyPeerAllowRules(state, topologyPeers);
+  if (apiProxyIp) {
+    const endpoints = [
+      ...(config.apiProxyUpstreams ?? []).map(endpoint => ({ ...endpoint, broker: false })),
+      ...(config.apiProxyBrokerUpstreams ?? []).map(endpoint => ({ ...endpoint, broker: true })),
+    ];
+    for (const [index, endpoint] of endpoints.entries()) {
+      if (!endpoint.broker && (endpoint.port === 80 || endpoint.port === 443)) continue;
+      state.rules.push({
+        id: `allow-api-proxy-upstream-${index}`,
+        order: ++state.order,
+        action: 'allow',
+        aclName: `api_upstream_source ${endpoint.broker ? 'api_broker_connect ' : ''}api_upstream_${index}_host api_upstream_${index}_port`,
+        protocol: endpoint.broker ? 'https' : 'both',
+        domains: [],
+        description: `Allow trusted API proxy ${apiProxyIp} to ${endpoint.hostname}:${endpoint.port}, subject to blocklist and DLP`,
+      });
+    }
+  }
   addPortSafetyRules(state);
   addApiProxyAllowRules(state, apiProxyIp);
   addAllowedIpRules(state, domains);

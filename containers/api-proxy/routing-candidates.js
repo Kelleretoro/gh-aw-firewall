@@ -1,8 +1,10 @@
 'use strict';
 
 const { isModelPermittedByPolicy } = require('./guards/model-policy-guard');
+const { getRetiredModelBlockState } = require('./guards/retired-model-guard');
 const { stripRedundantProviderPrefix } = require('./model-utils');
 const { createRoutingError } = require('./routing-errors');
+const { isModelEligible } = require('./model-eligibility');
 
 const PROVIDERS = Object.freeze({
   copilot: Object.freeze({ canonical: 'github-copilot', alias: 'copilot' }),
@@ -80,7 +82,7 @@ function makePairKey(model, effort) {
   return `${model.toLowerCase()}\u0000${effort === undefined ? '' : effort}`;
 }
 
-function buildRoutingCandidates({ catalogue, policy = {}, candidateModels }) {
+function buildRoutingCandidates({ catalogue, policy = {}, candidateModels, eligibilityRequest = {} }) {
   const provider = catalogue?.provider;
   const providerInfo = Object.hasOwn(PROVIDERS, provider) ? PROVIDERS[provider] : null;
   if (!catalogue || !providerInfo || catalogue.configured !== true) {
@@ -96,6 +98,11 @@ function buildRoutingCandidates({ catalogue, policy = {}, candidateModels }) {
   const providerModels = indexModels(catalogue.models, 'catalogue.models', model => model.id);
   const policyModels = new Map(
     [...providerModels].filter(([, model]) =>
+      (provider !== 'copilot' || !getRetiredModelBlockState(
+        stripRedundantProviderPrefix(model.id, providerInfo.canonical),
+        provider,
+        { inputMode: 'native' },
+      )) &&
       isModelPermittedByPolicy(model.id, allowedModels, disallowedModels, providerInfo.alias)),
   );
   if (policyModels.size === 0) {
@@ -112,6 +119,7 @@ function buildRoutingCandidates({ catalogue, policy = {}, candidateModels }) {
   const pairs = [];
   for (const providerModel of permittedModels.values()) {
     const nativeName = stripRedundantProviderPrefix(providerModel.id, providerInfo.canonical);
+    if (!isModelEligible(nativeName, provider, eligibilityRequest, { inputMode: 'native' })) continue;
     for (const { effort, protocol } of getModelRoutingChoices(providerModel, provider)) {
       pairs.push({
         model: `${providerInfo.canonical}/${nativeName}`,

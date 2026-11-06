@@ -1,9 +1,11 @@
 import { PROXY_ENV_VARS } from '../../upstream-proxy';
 import { WrapperConfig } from '../../types';
 import { addGithubTokenEnvVars } from './github-token-isolation';
+import { COPILOT_BROKER_PRIVATE_ENV, COPILOT_BROKER_CONTEXT_ENV } from '../../copilot-token-broker';
 
 export function buildExclusionSet(config: WrapperConfig): Set<string> {
   const excludedEnvVars = new Set([
+    ...COPILOT_BROKER_PRIVATE_ENV,
     'PATH',
     'PWD',
     'OLDPWD',
@@ -29,11 +31,15 @@ export function buildExclusionSet(config: WrapperConfig): Set<string> {
     'AWF_ENCLAVE_MCP_GATEWAY_CONTAINER',
     'AWF_ENCLAVE_MCP_READINESS_TIMEOUT_MS',
     'AWF_ENCLAVE_GITHUB_MCP_AGENT_ID',
+    'AWF_ENCLAVE_GITHUB_EXECUTOR_CAPABILITY',
     'AWF_ENCLAVE_GITHUB_DELEGATION_CONTROL_CAPABILITY',
     'AWF_ENCLAVE_GITHUB_DELEGATION_CONTROL_ENDPOINT',
     'AWF_ROUTING_CONFIG',
     'AWF_RESOLVED_CONFIG',
   ]);
+  if (config.copilotTokenBroker) {
+    for (const name of COPILOT_BROKER_CONTEXT_ENV) excludedEnvVars.add(name);
+  }
 
   if (config.enableApiProxy) {
     excludedEnvVars.add('AGENT_API_KEY');

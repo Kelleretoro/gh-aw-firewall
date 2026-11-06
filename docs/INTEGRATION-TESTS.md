@@ -71,6 +71,155 @@ digests. Scan targets, vulnerability database updates, and the blocking
 High/Critical PR-image gate are unchanged. The setup script validates the merged
 daemon configuration before restart and refuses local or self-hosted runners.
 
+For PR-image scans only, the runner opts into Docker's containerd image store
+before pulling images, then uses Buildx's `docker` driver with `--load`. Each
+image imports/exports a separate GitHub Actions v2 build cache (`mode=max`),
+scoped by image and UTC date. Only the current day's scope is imported: the first
+build each UTC day reruns package installation and security upgrades, rather than
+indefinitely reusing stale apt/apk layers. Within that day, fresh hosted runners
+can reuse the layers subject to normal Actions cache visibility/eviction.
+Cache export failures remain build failures, not silently ignored warnings.
+
+The shared build-tools image remains in the local daemon until enclave-agent
+finishes; that dependent build does not pull a replacement base. Intermediate
+builder cache is pruned after each export, and scanned image archives/images are
+removed sequentially to bound disk use. Build-tools retains Ubuntu's default
+archive/security mirrors instead of selecting Azure based on DNS alone. Apt
+retries transient fetch failures, treats incomplete index updates as errors, and
+still upgrades every installed package.
+
+After Grype's DB warm-up, the job restores ownership and owner read/write/traverse
+permissions to the runner user before `actions/cache/save` archives the DB.
+Warm-up and permission-repair failures stop the job. The
+`scripts/ci/docker-registry-ci.test.ts` and
+`scripts/ci/apt-mirror-dockerfiles.test.ts` fixtures cover these cache, freshness,
+mirror, scan-failure, base-image lifetime, and cleanup contracts; they do not
+replace a Linux Docker/hosted-runner build.
+
+All five chroot job definitions (including both browser runner variants) use
+`.github/actions/build-chroot-images` to build the checkout's Squid and agent,
+plus API proxy for browser tests, with the exact existing `:latest` local tags.
+The composite action uses the same Docker-driver/containerd-store and daily
+GitHub Actions v2 cache policy. Its scopes are separate by image, job, runner
+variant, and architecture to avoid concurrent matrix writers colliding; no
+previous-day scopes are imported. It verifies loaded images and prunes only
+intermediate build cache after export, keeping the images needed by tests.
+Build, cache export, inspection, and pruning errors fail preparation rather than
+running tests against incomplete images. Existing suites, runner matrix, cleanup,
+network isolation, and job/test timeout limits are unchanged.
+
+The agent's token-compiler and runtime stages now retain their base image's apt
+mirrors rather than selecting Azure via DNS; all Ubuntu stages reject partial
+index updates, retain fetch retries, and preserve required packages and runtime
+security upgrades. The oldest-runner browser payload and native t64 dependency
+resolution are unchanged. `scripts/ci/chroot-image-cache.test.ts` exercises the
+shared builder with Docker test doubles; actual Linux chroot execution remains
+the responsibility of the integration jobs. Grype is not used by these jobs.
+
+### NVX harness-observation limitation
+
+NVX currently launches the configured command through one atomic
+`NvxManager.execute()` lifecycle. It does not expose a persistent ready guest or
+a selected-harness probe/pre-command release interface, so NVX harness
+observations remain `runtime_probe_unsupported`. The existing manager tests and
+live evidence runner validate NVX execution and result/cleanup behavior only;
+they do not establish selected-harness evidence or guest compatibility for a
+probe lifecycle.
+
+**Current live acceptance status:** blocked, not live-accepted. A provider-free
+NVX guest acceptance run requires signed OpenVMM/kernel/initramfs/manifest
+artifacts, a distro layer, and host tooling including Bubblewrap and
+`mkfs.erofs`, in addition to a supported Linux x86_64/KVM runner. The recorded
+prerequisite attempt had no signed runtime bundle or distro layer and lacked
+Bubblewrap and `mkfs.erofs`. Deterministic fixtures are not a substitute for
+that guest evidence. No NVX harness-observation producer or live acceptance is
+claimed.
+
+### Provider-free Docker harness observations
+
+`.github/workflows/test-docker-harness-observation.yml` automatically runs two
+bounded jobs on GitHub-hosted Ubuntu 24.04 for relevant pull requests and pushes
+to `main`: native Docker agent execution and split-filesystem Docker-in-Docker.
+The latter uses separate Debian runner and Alpine Docker-daemon containers,
+stages runner system binaries under daemon-only `/runner`, and shares temporary
+files at runner `/tmp` versus daemon `/runner/tmp`. A live negative bind probe
+must reject the untranslated runner path before the translated mount succeeds.
+This tests the split-filesystem topology used by ARC/DinD; it is **not a
+Kubernetes or ARC deployment test**. The older ARC volume/log fixture that shares
+the same filesystem is not a substitute for this evidence.
+
+Both jobs build the production agent image and TypeScript from the tested
+checkout. `scripts/ci/live-docker-harness.cjs` uses the real agent-service builder,
+image entrypoint, chroot, capability/identity/trust setup, container-local tmpfs,
+Docker-exec observation transport, atomic report publisher and release gate.
+It supplies narrowly scoped fixture mounts and uses `network_mode: none` in place
+of Squid/provider services. This is a focused producer/lifecycle integration,
+not an end-to-end CLI, Squid, iptables-init, provider inference or enclave test.
+No provider request or real credential is needed.
+
+Direct fixture executables named `copilot`, `claude` and `codex` exercise bounded
+version output and ordinary command stdout/stderr/exit. Checks compare UID/GID,
+cwd, PATH, home/user, controlled exported environment, BASH_ENV startup effects
+and login-shell state between probe and command. The existing final command shell
+is non-login in these fixtures; the test does not enable a new login-shell mode.
+The exact expected PATH includes the entrypoint's npm-global prefix. The pinned
+fixture reapplies its shell hash after PATH setup and makes the competing PATH
+executable exit 99, so successful probing and command exit 23 prove the pin wins.
+Cases cover publication before release, missing/malformed/overflow/failed/timeout
+observations, unchanged unconstrained admission, test-only incompatible and
+unverified evaluator requirements withholding release, shell-pinned resolution,
+unverified shell functions, wrong-run transport, cancellation, early startup exit
+and ownership-checked container removal. The blocking cases invoke the real
+`runMainWorkflow`/`observeHarness` admission recheck with live Docker lifecycle
+adapters, injecting a floor only at the test process's model-validator module
+boundary (as in the existing deterministic tests). They verify neither release
+nor command wait is reached. This does not install production constraints or add
+a configuration bypass. Bundled harness constraints remain empty and configured
+catalogue harness facts remain rejected.
+
+A separate networkless container uses the real proxy report reader on a
+read-only mount to check root ownership, writable-file/symlink rejection,
+stale-run binding and immutable evidence across atomic replacement. A
+no-binding reader must not infer primary evidence. Existing deterministic
+service-builder checks additionally verify dedicated enclave proxies receive no
+primary harness environment; no enclave producer is added or claimed.
+
+For native reproduction on a disposable Linux Docker host with `libcap2-bin`:
+
+```bash
+npm ci
+npm run build
+docker build --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+  -t awf-harness-agent:local containers/agent
+sudo env "PATH=$PATH" "AWF_LIVE_COMMIT=$(git rev-parse HEAD)" \
+  timeout --kill-after=20s 420s node scripts/ci/live-docker-harness.cjs
+```
+
+The split job additionally builds `Dockerfile.runner` and invokes
+`scripts/ci/live-docker-harness-split.sh`; its privileged outer-daemon launcher
+refuses non-GitHub-hosted environments. Cleanup removes only the generated
+Compose project's resources and label-verified test-owned containers, never
+prunes the shared daemon. An existing `awf-agent` causes a preflight failure
+rather than being removed. Per-container memory/PID/CPU limits, subprocess and
+job deadlines, and signal cleanup bound execution.
+
+Uploaded `harness-live-native` and `harness-live-split-dind` JSON artifacts contain
+the tested commit, actual agent image ID, Docker/Node/platform identification,
+sanitized canonical reports, per-case outcomes and cleanup status. They exclude
+raw version metadata, full environment, credentials, Compose dumps and container
+logs. On failure, a bounded diagnostic records container state, numeric probe
+exit status, context-file presence and allowlisted entrypoint error classes,
+never raw stderr or environment values. `harness-deterministic` is a separately named Jest fixture artifact, **not
+live proof**. Deterministic workflow/fixture regressions run with:
+
+```bash
+npx jest --runInBand --runTestsByPath scripts/ci/live-docker-harness-workflow.test.ts
+```
+
+Live acceptance is established only by successful jobs and their artifacts for
+the exact tested commit; local deterministic results or an unavailable Docker
+daemon must not be reported as live acceptance.
+
 ### Unified enclave coverage
 
 Cloud Hypervisor enclave contract coverage runs in
@@ -343,6 +492,75 @@ Each document provides per-test-case analysis with plain-language descriptions, 
 - **[Container & Operations Tests](test-analysis/container-ops.md)** — Workdir, volumes, git, env vars, logging, Docker availability
 - **[CI & Smoke Tests](test-analysis/ci-smoke.md)** — All 27 CI/smoke/build-test workflows analyzed
 - **[Test Infrastructure](test-analysis/test-infra.md)** — Runner architecture, batch pattern, cleanup strategy, limitations
+
+## Daily agent/runtime regression matrix
+
+`daily-agent-runtime-regression.yml` runs daily at 06:37 UTC and supports manual
+dispatch. It exercises Copilot, Codex, and Claude under Docker, Cloud Hypervisor,
+and NVX in nine independent primary-agent jobs, plus all three agents **inside**
+Docker and Cloud Hypervisor agent enclaves in six more jobs. Both matrices have
+fail-fast disabled. Manual dispatch must use the `main` workflow ref.
+
+The shared build checks out `main`, records its exact commit, and builds the AWF
+CLI, Squid, agent, API proxy, and three enclave images once. Every regression job checks out that
+same commit, verifies and restores the run-scoped CLI/image artifacts, and uses
+commit-tagged local images with `--skip-pull`; no job substitutes a released AWF
+binary or GHCR image. Cloud Hypervisor guest artifacts (including source-built
+AWF build-tools and supervisor) and the NVX guest distro are also prepared once
+per run. NVX retains its pinned upstream artifacts and requires a manifest
+attested by this exact workflow, explicitly selected as the expected signer.
+The production default signer remains the release workflow.
+
+The six enclave jobs reuse `agent-runtime-awf-build` and
+`agent-runtime-cloud-hypervisor`, including the same enclave source images used
+to construct the shared guest rootfs. They do not rebuild or pull replacement
+images. The source-built CLI has a build-time-only, full-main-SHA Cloud
+Hypervisor compatibility profile, and this workflow attests both microVM
+manifests and the shared enclave rootfs; unsigned enclave artifacts remain
+forbidden.
+
+Each enclave cell invokes the selected native coding agent through the existing
+public enclave MCP route. A minimal Docker primary keeps that route alive; the
+coding agent itself runs in the selected single-use enclave, not the primary.
+The agent must use its shell tool to read the public repository seed, prove
+read-only mounts, credential isolation, non-root/no-capability execution and
+network confinement, then write the exact finite-schema result to `/awf/out`.
+The host requires one successful audited invocation and the matching unique proof.
+
+Enclave fixtures use `github/gh-aw-firewall` with **`public` sensitivity** and
+`enclaveDebugPublic: true`. AWF still independently verifies unauthenticated
+public visibility. On success or failure, the existing host-only collector
+publishes bounded, secret-redacted enclave/session/proxy diagnostics with
+one-day retention. Private working state, provider credentials, raw AWF host
+logs and gateway capabilities are never uploaded.
+
+Each cell checks allowed and denied HTTPS access, credential isolation, real
+provider inference through the API proxy, and an agent tool writing a unique
+proof file through the live workspace share. Missing credentials, nonzero exits,
+missing proof files, and incorrect model responses fail the job rather than
+merely producing a FAIL summary. Evidence artifacts identify the tested source
+commit and retain logs for seven days. A failed VM artifact build does not
+suppress Docker jobs or the other VM runtime's jobs.
+
+After all builds and matrix jobs finish, a deterministic reporting job creates
+one GitHub issue if any build or regression job failed, without changing the
+failing Actions status. The report links the run attempt and each failed job,
+lists failed step names, and identifies the tested source revision (or explicitly
+notes when the build could not publish it). Only job metadata is published, not
+logs, prompts, credentials, or artifacts. Issue-write and Actions-read access are
+limited to the reporting job.
+
+Failing reruns update the same run's issue, including closed issues without
+reopening them, using the latest job results across attempts for partial reruns.
+Successful and cancelled-only runs create no issue; a successful rerun leaves
+any earlier failure report unchanged.
+
+Required credentials follow the existing smoke workflows: Copilot uses
+`COPILOT_GITHUB_TOKEN` or the job token with `copilot-requests: write`; Codex uses
+`CODEX_API_KEY` or `OPENAI_API_KEY`; Claude uses `ANTHROPIC_API_KEY`. Agent CLI
+versions are pinned in the workflow, except enclave Copilot, which retains the
+sealed `containers/enclave/package-lock.json` pin. The existing engine-specific smoke
+workflows remain available for focused PR/label-triggered checks.
 
 ## Cloud Hypervisor preview integration tests
 

@@ -1,6 +1,6 @@
 'use strict';
 
-const { normalizeApiTarget } = require('../proxy-utils');
+const { normalizeApiTarget, getTargetHostname, getTargetScheme } = require('../proxy-utils');
 const { COPILOT_PLACEHOLDER_TOKEN } = require('./copilot-byok');
 const { URL } = require('url');
 
@@ -163,8 +163,13 @@ function deriveGitHubApiBasePath(env = process.env) {
   }
 }
 
+function getCopilotTargetIdentity(rawTarget) {
+  const hostname = getTargetHostname(rawTarget);
+  return hostname && getTargetScheme(rawTarget) === 'http' ? `http://${hostname}` : hostname;
+}
+
 function isGithubCopilotCatalogTarget(rawTarget) {
-  const target = normalizeApiTarget(rawTarget);
+  const target = getCopilotTargetIdentity(rawTarget);
   if (!target) return true;
   return target === 'api.githubcopilot.com'
     || target === 'api.enterprise.githubcopilot.com'
@@ -183,9 +188,9 @@ function getCopilotModelFallbackPolicy(modelFallback, env = process.env) {
     || (env.COPILOT_PROVIDER_API_KEY || '').trim()
   );
 
-  // Standard Copilot (no BYOK hints): suppress fallback because Copilot is
-  // authoritative for its own model catalogue. Rewriting a retired/restricted
-  // model to a middle-power fallback obscures the real error.
+  // Suppress unconstrained middle-power alias fallback on authoritative
+  // Copilot catalogues. Request-level model recovery separately checks
+  // endpoint/features, policy and budgets against the discovered catalogue.
   if (!hasByokHints) {
     return {
       effective: { ...modelFallback, enabled: false },
@@ -230,7 +235,7 @@ function isGhesInstance(resolvedTarget, env = process.env) {
   // Explicit non-GHES platform types override heuristics
   if (env.AWF_PLATFORM_TYPE && env.AWF_PLATFORM_TYPE !== 'ghes') return false;
 
-  if (resolvedTarget === 'api.enterprise.githubcopilot.com') return true;
+  if (getCopilotTargetIdentity(resolvedTarget) === 'api.enterprise.githubcopilot.com') return true;
   return classifyGithubServerHost(env).kind === 'ghes';
 }
 
@@ -288,7 +293,7 @@ function copilotTargetRequiresGitHubTokenPrefix(resolvedTarget, env = process.en
   // GitHub OAuth/PAT credentials, regardless of platform type. This check must
   // come before the AWF_PLATFORM_TYPE guard so that an explicit platform type
   // does not suppress the required 'token' prefix.
-  const target = normalizeApiTarget(resolvedTarget);
+  const target = getCopilotTargetIdentity(resolvedTarget);
   if (target && (
     GITHUB_TOKEN_PREFIX_COPILOT_TARGETS.has(target)
   )) return true;

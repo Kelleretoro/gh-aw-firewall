@@ -17,6 +17,12 @@ const COMPILER_EMITTED_COPY_STEP =
   '          cp "$COPILOT_SRC" "${RUNNER_TEMP}/gh-aw/bin/copilot"\n' +
   '          chmod +x "${RUNNER_TEMP}/gh-aw/bin/copilot"\n';
 
+const COMPILER_EMITTED_SESSION_STATE_STEP =
+  '      - name: Copy Copilot session state files to logs\n' +
+  '        if: always()\n' +
+  '        continue-on-error: true\n' +
+  '        run: bash "${RUNNER_TEMP}/gh-aw/actions/copy_copilot_session_state.sh"\n';
+
 function lockFileWithEngine(engineId: string): string {
   return (
     'jobs:\n' +
@@ -27,6 +33,15 @@ function lockFileWithEngine(engineId: string): string {
     COMPILER_EMITTED_COPY_STEP
   );
 }
+
+describe('Copilot session-state collection', () => {
+  it('preserves the compiler-pinned copy helper', () => {
+    expect(applyGeneralWorkflowPatches(
+      COMPILER_EMITTED_SESSION_STATE_STEP,
+      '/tmp/workflows/pr-sous-chef.lock.yml',
+    ).content).toBe(COMPILER_EMITTED_SESSION_STATE_STEP);
+  });
+});
 
 describe('applyGeneralWorkflowPatches disabled admission outputs', () => {
   const compilerOutput =
@@ -91,6 +106,36 @@ describe('applyGeneralWorkflowPatches disabled admission outputs', () => {
     const input = compilerOutput.replace('    outputs:\n', '    other:\n');
     expect(() => applyGeneralWorkflowPatches(input, '/tmp/example.lock.yml'))
       .toThrow('Missing activation outputs for disabled admission');
+  });
+});
+
+describe('applyGeneralWorkflowPatches runtime auditor credential exclusions', () => {
+  const compiledAuditor = [
+    'jobs:',
+    '  agent:',
+    '    steps:',
+    '      - run: |',
+    '          awf --config /tmp/config.json --env-all --log-level info \\',
+    '      - run: |',
+    '          awf --config /tmp/config.json --env-all --mount /tmp/data',
+    '',
+  ].join('\n');
+  const lockPath = '/tmp/workflow-runtime-auditor.lock.yml';
+
+  it('excludes OTLP credentials from both sandbox commands idempotently', () => {
+    const { content } = applyGeneralWorkflowPatches(compiledAuditor, lockPath);
+    expect(content.match(/--exclude-env GH_AW_DEFAULT_OTLP_HEADERS/g)).toHaveLength(2);
+    expect(content.match(/--exclude-env GH_AW_OTLP_ENDPOINTS/g)).toHaveLength(2);
+    expect(content.match(/--exclude-env OTEL_EXPORTER_OTLP_HEADERS/g)).toHaveLength(2);
+    expect(content.match(/--exclude-env OTEL_EXPORTER_OTLP_ENDPOINT/g)).toHaveLength(2);
+    expect(applyGeneralWorkflowPatches(content, lockPath).content).toBe(content);
+  });
+
+  it('fails when the compiler output no longer has both sandbox commands', () => {
+    expect(() => applyGeneralWorkflowPatches(
+      compiledAuditor.replace(/awf --config[^\n]+/g, 'echo no sandbox'),
+      lockPath,
+    )).toThrow('Expected both AWF sandbox commands');
   });
 });
 
@@ -214,6 +259,8 @@ describe('applyGeneralWorkflowPatches published AWF maintenance workflows', () =
     'auth-doctor-updater.lock.yml',
     'doc-maintainer.lock.yml',
     'model-api-mapping-updater.lock.yml',
+    'pr-sous-chef.lock.yml',
+    'mount-docs-maintainer.lock.yml',
     'schema-sync.lock.yml',
     'self-hosted-runner-doctor-updater.lock.yml',
     'update-release-notes.lock.yml',
@@ -362,7 +409,7 @@ describe('applyGeneralWorkflowPatches shared enclave gateway policy', () => {
 
     const first = applyGeneralWorkflowPatches(compiled, workflowPath);
     const invocation = first.content.split('\n').find(line =>
-      line.includes('sudo --preserve-env awf --cloud-hypervisor-enclave-debug-public --config '));
+      line.includes('awf --cloud-hypervisor-enclave-debug-public --config '));
     expect(invocation).toContain('--env-all');
     expect(invocation?.split(exclusion).length).toBe(2);
     expect(first.log).toContain('  Excluded host-only enclave rootfs from the primary agent');

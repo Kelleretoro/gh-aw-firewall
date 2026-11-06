@@ -11,6 +11,7 @@ const http = require('http');
 const https = require('https');
 const { getCatalogueLoader } = require('./catalogue-loader');
 const { captureRuntimePricing } = require('./runtime-model-catalog');
+const { pinRequestEligibility } = require('./model-eligibility');
 const { HTTPS_PROXY, proxyAgent } = require('./http-client');
 const { createBodyHandler, sleep, _setSleepForTests, _resetSleepForTests } = require('./body-handler');
 const { generateRequestId, sanitizeForLog, logRequest } = require('./logging');
@@ -65,7 +66,7 @@ const {
   getAiCreditsReflectState,
   getAiCreditsBlockState,
   buildAiCreditsLimitError,
-  checkUnknownModelRejection,
+  checkModelPricing,
   resetAiCreditsGuardForTests,
 } = require('./guards/ai-credits-guard');
 const {
@@ -77,6 +78,7 @@ const {
   buildModelPolicyError,
 } = require('./guards/model-policy-guard');
 const { enforceGuards, getCurrentGuardChecks } = require('./proxy-guards');
+const { isGithubCopilotCatalogTarget } = require('./providers/copilot-auth');
 
 // ── Optional token tracker (graceful degradation when not bundled) ────────────
 let trackTokenUsage;
@@ -163,7 +165,7 @@ const proxyWebSocket = createProxyWebSocket({
   buildModelMultiplierCapError,
   getRetiredModelBlockState,
   buildRetiredModelError,
-  checkUnknownModelRejection,
+  checkModelPricing,
   getModelPolicyBlockState,
   buildModelPolicyError,
   trackWebSocketTokenUsage,
@@ -235,6 +237,8 @@ const sendUpstreamRequest = createSendUpstreamRequest({
  * @param {'http'|'https'} [targetScheme='https'] - Upstream scheme (see proxy-utils.js normalizeApiTarget)
  */
 function proxyRequest(req, res, targetHost, injectHeaders, provider, basePath = '', bodyTransform = null, requestSigner = null, targetScheme = 'https') {
+  pinRequestEligibility(req);
+  req.awfModelCatalogAuthoritative = provider === 'copilot' && isGithubCopilotCatalogTarget(targetHost);
   if (!Object.hasOwn(req, 'awfCatalogue')) req.awfCatalogue = getCatalogueLoader().capture();
   if (!req.awfRuntimePricing) req.awfRuntimePricing = captureRuntimePricing();
   const clientRequestId = req.headers['x-request-id'];

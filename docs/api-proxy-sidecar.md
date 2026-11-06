@@ -73,6 +73,52 @@ The `--enable-api-proxy` CLI flag is deprecated and ignored — it is kept only 
 4. Squid recognizes the trusted sidecar source IP and bypasses domain ACL evaluation
 5. Request reaches `api.openai.com` or `api.anthropic.com`
 
+### In-network endpoint contract for launchers
+
+AWF sets these variables in the agent environment whenever the API proxy is
+configured, independently of which provider credentials are present:
+
+| Variable | Default Docker-agent URL |
+|---|---|
+| `AWF_API_PROXY_OPENAI_URL` | `http://172.30.0.30:10000` |
+| `AWF_API_PROXY_ANTHROPIC_URL` | `http://172.30.0.30:10001` |
+| `AWF_API_PROXY_COPILOT_URL` | `http://172.30.0.30:10002` |
+| `AWF_API_PROXY_GEMINI_URL` | `http://172.30.0.30:10003` |
+| `AWF_API_PROXY_VERTEX_URL` | `http://172.30.0.30:10004` |
+
+These are local listener origins, not upstream API targets; they contain no
+credentials and do not indicate that a provider is authenticated. The URLs use
+the runtime-selected proxy address (also available as `AWF_API_PROXY_IP`), so
+launchers must read them inside the sandbox rather than hardcode the default
+subnet. Append any provider-required API path separately.
+
+For Compose-managed agents, host-service access is independent of inference
+routing. `--enable-host-access` and `--allow-host-service-ports 5432` may make
+PostgreSQL reachable through `host.docker.internal`, but do not move or publish
+the API proxy on the host. In particular, port `10002` is not published on the
+host in this topology. MicroVM backends select their own reachable proxy address
+and may publish infrastructure ports; launchers should still use these variables.
+
+For Claude using Copilot inference, the compiler-generated launcher must select
+the Copilot listener, regardless of host access, before running its preflight
+health check or starting Claude:
+
+```bash
+# Run inside the AWF agent sandbox, not in a host-runner setup step.
+export ANTHROPIC_BASE_URL="${AWF_API_PROXY_COPILOT_URL:?AWF Copilot proxy URL is required}"
+curl --fail --silent --show-error "${ANTHROPIC_BASE_URL}/health"
+```
+
+The inherited host/runner `ANTHROPIC_BASE_URL` must not be forwarded into the
+AWF agent environment: AWF checks it before the launcher runs, so a stale
+host-gateway URL can fail startup when only Copilot credentials are available.
+The compiler must omit it from explicit `--env` and `--env-file` inputs. If
+using `--env-all`, exclude it with `--exclude-env ANTHROPIC_BASE_URL`. Set the
+Copilot URL only in the in-sandbox launcher above.
+
+The workflow compiler must consume this contract; enabling host access alone
+must never select `http://host.docker.internal:10002` as the inference gateway.
+
 ## Usage
 
 ### Restrict BYOK models
@@ -142,6 +188,86 @@ provider route, not Copilot-only: a LiteLLM-style `openai/gpt-6-sol` sent to
 the OpenAI route (port `10000`) is normalized to `gpt-6-sol` before the
 request reaches OpenAI, so harnesses like Pi that send provider-prefixed model
 IDs no longer receive an opaque upstream `400` for an unrecognized model name.
+
+### OpenAI Decisions API
+
+The OpenAI listener forwards `POST /v1/decisions` (or `/decisions` with the
+configured upstream base path) using the same trusted sidecar as Chat
+Completions and Responses. No protocol adapter or separate service is needed.
+OpenAI currently supports `gpt-6-luna` for Decisions; availability on compatible
+providers, including Azure OpenAI deployments, is determined by that upstream.
+AWF does not hardcode a Decisions model allowlist.
+
+Run this example **inside the AWF sandbox** with a standard OpenAI SDK release
+that includes `client.decisions.create()`:
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url=os.environ["AWF_API_PROXY_OPENAI_URL"].rstrip("/") + "/v1",
+    api_key="awf-placeholder",  # Not a real credential.
+)
+decision = client.decisions.create(
+    model="gpt-6-luna",
+    input="The answer is 42.",
+    questions=[
+        {"type": "predicate", "instructions": "Does the answer contain a number?"},
+        {
+            "type": "choice",
+            "instructions": "Classify the answer.",
+            "choices": [{"value": "numeric"}, {"value": "other"}],
+        },
+        {
+            "type": "score",
+            "instructions": "Rate how concise the answer is.",
+            "levels": [{"label": "verbose"}, {"label": "concise"}],
+        },
+    ],
+)
+print(decision.answers)
+```
+
+Supply the real `OPENAI_API_KEY` through the existing host-side secure
+configuration, never in the agent script. The proxy replaces client
+authentication with its configured static key or OIDC token. Existing
+`OPENAI_API_TARGET`, `OPENAI_API_BASE_PATH`, and `AWF_OPENAI_AUTH_HEADER`
+settings apply, including `api-key` authentication for compatible Azure targets.
+For a custom upstream base path such as `/openai/v1`, use the listener origin
+without `/v1` as the SDK base URL; AWF prepends the configured path.
+Model allowlists, denylists, provider-qualified restrictions, and aliases apply
+before forwarding; a resolved model must also be supported by the upstream.
+Decisions requests are not translated into Chat Completions or Responses for
+cross-provider fallback.
+
+Requests may contain 1–400 predicate, choice, or score questions. AWF preserves
+their order and native answers (including refusals), structured JSON, images,
+conversation and tool history, `prompt_cache_key`, `prompt_cache_options`, and
+explicit cache breakpoints. Upstream validation, errors, and status codes are
+preserved. The shared 10 MB request limit and rate limits still apply.
+
+Usage feeds the existing audit, token metrics, AI-credit budget, and cache-miss
+controls. `input_tokens_details.cached_tokens` and `cache_write_tokens` are
+accounted for separately without double-counting total input. Successful
+Decisions requests count once against the shared invocation limit, even for a
+400-question batch. Budget and timeout steering messages are not inserted into
+evaluation evidence; hard budget enforcement remains active.
+
+The proxy's automated tests use a local mock upstream. The additional native
+JavaScript SDK conformance test runs when an OpenAI SDK with Decisions support
+is installed and Node.js 22+ is available; it is otherwise skipped. For example,
+install the SDK outside the repository with
+`npm install --prefix /tmp/awf-decisions-sdk openai` and run the proxy tests with
+`NODE_PATH=/tmp/awf-decisions-sdk/node_modules npm test -- --runInBand server.decisions.test.js`.
+For an optional live check, run the example through AWF with your
+existing secure provider configuration and a Decisions-enabled account; it
+incurs API usage. The opt-in automated check can also be run inside that sandbox
+from `containers/api-proxy` with
+`AWF_TEST_LIVE_DECISIONS=1 NODE_PATH=/tmp/awf-decisions-sdk/node_modules npm test -- --runInBand server.decisions.test.js`.
+Proxy dependencies and supported runtime versions are unchanged. See the
+[OpenAI Decisions API reference](https://developers.openai.com/api/reference/python/resources/decisions/methods/create)
+for the provider contract.
 
 ### Claude Code example
 
@@ -700,6 +826,51 @@ apiProxy:
       fallback: false
 ```
 
+### Retired and unavailable model recovery
+
+With `apiProxy.modelFallback.enabled` (the default), HTTP Responses, Chat
+Completions, and Messages inference requests recover from retired or unavailable
+models without requiring `fallbackModels`.
+Known-retired Copilot IDs prefer their suggested replacement if it is in the
+discovered catalogue, compatible, and permitted. Other candidates come from the
+same backend's captured catalogue in deterministic version-descending order.
+On native Copilot backends, a concrete ID missing from a populated catalogue is
+also recovered before dispatch. Custom deployment IDs are not presumed
+unavailable merely because a provider does not list them.
+
+An upstream model-specific `400`/`404` (`model_not_supported`, `model_not_found`,
+or endpoint unavailability) can also trigger recovery. Configured
+`fallbackModels` retain their ordering and are tried before automatic catalogue
+alternatives. Automatic recovery never switches providers or credentials, never
+handles generic validation errors, `401`, `403`, `429`, or `5xx`, and makes at
+most three model substitutions per request, including a pre-dispatch replacement.
+Existing same-model endpoint recovery remains available.
+
+Automatic candidates must preserve the client's endpoint/protocol, tools,
+streaming, structured-output and multimodal requirements, explicit reasoning
+effort, and known context/output limits. Unknown feature support fails closed:
+AWF does not drop tools, remove request fields, or normalize an unsupported
+effort to make a replacement work. Every replacement passes the existing
+allow/deny, multiplier, credit-pricing, and budget guards. Enclave capability
+checks and per-attempt reservations still run before each upstream dispatch.
+Requests whose model remains available are unchanged by this recovery path.
+
+Each substitution emits a structured `model_fallback` warning containing the
+requested/from/to model, provider, and retirement/unavailability reason, without
+prompts or credentials. Token usage and routing evidence retain the replacement
+and original selection; pricing uses the request's captured catalogue. No
+compatible candidate produces `model_recovery_exhausted` before dispatch or
+`model_fallback_exhausted` after an upstream model rejection. Endpoint translation
+incompatibilities retain their actionable endpoint/feature error.
+
+`modelFallback.enabled: false`, `modelFallback.excludeEngines`, strict aliases
+with `fallback: false`, scoped-auto selection, and routing-classifier requests
+do not gain unconstrained recovery. WebSocket tunnels remain opaque: AWF cannot
+prove compatibility for tools/features in future frames, so it does not rewrite
+only the handshake or replay a live session. Known-retired or catalog-unavailable
+handshake models fail explicitly; use HTTP inference for automatic recovery or
+select an available model before opening the WebSocket.
+
 ### Ordered fallback models
 
 When the upstream rejects the requested model, you can give the proxy an ordered
@@ -918,8 +1089,16 @@ logged as a `model_routing` event with `stage: "request"` and
 or `provider`), recording requested and selected values side by side. Endpoint
 differences are informational: they remain in `deviations` but do not by
 themselves make a request `deviated`. Only genuine routing failures (no
-selection could be produced, or an upstream failure on a request that used the
-selected provider and model) end the run with exit `78`.
+selection could be produced, or an unrecovered upstream failure on a request
+that used the selected provider and model) end the run with exit `78`.
+Primary-request failures remain provisional until observed responses and SSE
+inspection have drained. A later fully completed 2xx request on the same selected
+provider and model recovers an earlier failure; another route, preliminary HTTP
+200, or an abandoned request does not. Streaming recovery requires a protocol
+terminal success event without a stream error. Request telemetry is retained
+unchanged, and only an unrecovered failure publishes the terminal private result
+and primary `stage: "failure"` record. Independent nonzero harness exits remain
+nonzero.
 
 ### Model-routing audit log
 
@@ -972,8 +1151,11 @@ rejection, not a failure to select a route. HTTP success alone does not imply
 the connection before AWF finished writing, after the upstream sent its
 protocol terminal success event (`response.completed` for Responses,
 `message_stop` for Messages, or `data: [DONE]` for Chat Completions). Codex,
-for example, stops reading at `response.completed`. Unlike `aborted`, a
-`client_closed` request on the selected model does not fail the routed run.
+for example, stops reading at `response.completed`. A client cancellation before
+terminal success remains `aborted`, not successful completion or recovery
+evidence. Without an observed upstream error, that cancellation does not itself
+fail the routed run or write a `stage: "failure"` record. Real upstream resets,
+SSE errors, and streams ending without terminal success remain failure evidence.
 Request records include `requested_endpoint` and `upstream_endpoint`; these
 differ when the Copilot proxy translates a request for a model that supports
 only the other wire API. Endpoint-only translation remains informational and
@@ -1296,8 +1478,10 @@ Exchanges the GitHub OIDC JWT for a GCP access token via the Security Token Serv
 | `AWF_AUTH_GCP_WORKLOAD_IDENTITY_PROVIDER` | ✅ | — | Full resource name of the Workload Identity Provider |
 | `AWF_AUTH_GCP_SERVICE_ACCOUNT` | No | — | Service account email to impersonate (omit for direct access) |
 | `AWF_AUTH_GCP_SCOPE` | No | `https://www.googleapis.com/auth/cloud-platform` | OAuth2 scope |
+| `AWF_AUTH_GCP_PROJECT` | For native Vertex express-path rewriting | — | Google Cloud resource project ID supplied by the compiler |
+| `AWF_AUTH_GCP_LOCATION` | For native Vertex express-path rewriting | — | Vertex location supplied by the compiler (e.g. `us-central1` or `global`) |
 
-Default OIDC audience: the `gcpWorkloadIdentityProvider` value
+Default GitHub OIDC audience: `https://iam.googleapis.com/` followed by the `gcpWorkloadIdentityProvider` value. `AWF_AUTH_OIDC_AUDIENCE` overrides this default; the STS audience remains `//iam.googleapis.com/` followed by the provider resource name.
 
 :::note
 `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` are injected by the Actions runner automatically. AWF forwards them to the sidecar when `AWF_AUTH_TYPE=github-oidc` and excludes them from the agent container.
@@ -1308,7 +1492,9 @@ When `gcpServiceAccount` is omitted, the federated token is used directly withou
 :::
 
 :::note[Supported Vertex paths]
-For the Gemini CLI Vertex mode (`GOOGLE_GENAI_USE_VERTEXAI=true`), use the native Vertex adapter on port 10004. AWF sets `GOOGLE_VERTEX_BASE_URL`, exchanges GCP WIF credentials in the sidecar, and forwards to `aiplatform.googleapis.com` (or `VERTEX_API_TARGET`). Billing and quota are charged to the Google Cloud project associated with the impersonated service account, or to the directly granted workload identity principal when no service account is configured.
+For the Gemini CLI Vertex mode (`GOOGLE_GENAI_USE_VERTEXAI=true`), use the native Vertex adapter on port 10004. AWF sets `GOOGLE_VERTEX_BASE_URL` and exchanges GCP WIF credentials in the sidecar. The compiler must supply `AWF_AUTH_GCP_PROJECT` and `AWF_AUTH_GCP_LOCATION` to the host AWF process; AWF forwards these to the sidecar. In GCP OIDC mode, native `/v1/publishers/google/models/MODEL:METHOD` and `/v1beta1/publishers/google/models/MODEL:METHOD` paths are rewritten to include `/projects/PROJECT/locations/LOCATION`, preserving the API version, method, and query string. The resource project selects the target Google Cloud project; it is not inferred from the workload identity provider or service account.
+
+Regional locations use `LOCATION-aiplatform.googleapis.com`; the `us` and `eu` multi-regions use `aiplatform.us.rep.googleapis.com` and `aiplatform.eu.rep.googleapis.com`, respectively, and `global` uses `aiplatform.googleapis.com`. `VERTEX_API_TARGET` still overrides the host. Already project-scoped paths are not rewritten, and their host is selected from the location in the path. Static-key express mode is unchanged. If either project or location is absent, paths are left unchanged.
 
 OpenAI-compatible Vertex endpoints can still use the OpenAI adapter (`OPENAI_API_TARGET` plus a resource-specific `OPENAI_API_BASE_PATH` such as `/v1/projects/PROJECT_ID/locations/LOCATION/endpoints/openapi`).
 :::
@@ -1721,9 +1907,10 @@ If Copilot returns `model "..." is not accessible via the ... endpoint`, the
 proxy tries the other wire API once for the **same model**, provided the request
 can be translated without dropping features. This handles missing or stale
 endpoint metadata. If translation is incompatible or the other endpoint also
-rejects the model, the proxy returns an actionable HTTP 400. Model changes are
-limited to configured alias candidates or an explicit model fallback policy;
-endpoint recovery does not invent a replacement model.
+rejects the model, the proxy can try a compatible policy-permitted model from
+the discovered catalogue (or an explicitly configured alias/fallback candidate).
+If no candidate can preserve the request, it returns an actionable error;
+endpoint recovery never drops features.
 
 ### Supported features
 

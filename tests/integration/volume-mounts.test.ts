@@ -42,9 +42,45 @@ describe('Volume Mount Functionality', () => {
   afterEach(() => {
     // Clean up test directory
     if (fs.existsSync(testDir)) {
+      fs.chmodSync(testDir, 0o700);
       fs.rmSync(testDir, { recursive: true, force: true });
     }
   });
+
+  test.each(['readable', 'empty', 'unreadable-directory', 'unreadable-file'])(
+    'Detector input preflight with a %s read-write mount',
+    async (state) => {
+      const inputFile = path.join(testDir, 'agent_output.json');
+      fs.chmodSync(testDir, 0o755);
+      if (state !== 'empty') {
+        fs.writeFileSync(inputFile, '{"output":"staged detector input"}', { mode: 0o644 });
+      }
+      if (state === 'unreadable-directory') fs.chmodSync(testDir, 0);
+      if (state === 'unreadable-file') fs.chmodSync(inputFile, 0);
+
+      const inputDir = '/tmp/gh-aw/threat-detection';
+      const result = await runner.run(
+        'printf "DETECTOR_CLEAN_VERDICT\\n"',
+        {
+          allowDomains: ['github.com'],
+          volumeMounts: [`${testDir}:${inputDir}:rw`],
+          inputDirs: [inputDir],
+          timeout: 60000,
+        }
+      );
+
+      expect(result.timedOut).toBe(false);
+      if (state === 'readable') {
+        expect(result).toSucceed();
+        expect(result.stdout).toMatch(/^DETECTOR_CLEAN_VERDICT$/m);
+      } else {
+        expect(result.exitCode).toBe(1);
+        expect(result.stdout).not.toMatch(/^DETECTOR_CLEAN_VERDICT$/m);
+        expect(result.stdout + result.stderr).toMatch(/^AWF input preflight failed:/m);
+      }
+    },
+    120000
+  );
 
   test('Test 1: Read-only custom mount', async () => {
     // Create a test file
@@ -111,6 +147,54 @@ describe('Volume Mount Functionality', () => {
     expect(result.stdout).toContain('Content 1');
     expect(result.stdout).toContain('Content 2');
   }, 120000);
+
+  test('ARC/DinD agent logs are readable at the runner mount source without a symlink', async () => {
+    const runnerTemp = path.join(testDir, 'runner-temp');
+    const runnerRoot = path.join(runnerTemp, 'gh-aw');
+    const logsDir = path.join(runnerRoot, 'sandbox/agent/logs');
+    const sandboxLogsDir = '/tmp/gh-aw/sandbox/agent/logs';
+    const configFile = path.join(testDir, 'arc-dind.json');
+    fs.mkdirSync(logsDir, { recursive: true });
+    // Docker cannot create hiding-overlay mountpoints in a read-only parent.
+    for (const relativePath of ['mcp-logs', 'sandbox/firewall/logs', 'sandbox/firewall/audit']) {
+      fs.mkdirSync(path.join(runnerRoot, relativePath), { recursive: true });
+    }
+    // The local runner and daemon share source paths; unit tests cover daemon-only prefixes.
+    fs.writeFileSync(configFile, JSON.stringify({
+      runner: { topology: 'arc-dind' },
+      apiProxy: { enabled: false },
+    }));
+
+    // A deterministic producer avoids needing Copilot credentials for the mount handoff.
+    const logContent = 'agent conversation fixture';
+    const result = await runner.run(
+      `printf '%s\\n' '${logContent}' > ${sandboxLogsDir}/session.log`,
+      {
+        configFile,
+        env: { RUNNER_TEMP: runnerTemp },
+        allowDomains: ['github.com'],
+        volumeMounts: [
+          `${runnerRoot}:/tmp/gh-aw:ro`,
+          `${logsDir}:${sandboxLogsDir}:rw`,
+        ],
+        timeout: 120000,
+      },
+    );
+
+    expect(result).toSucceed();
+    expect(fs.readdirSync(logsDir)).toEqual(['session.log']);
+    expect(fs.readFileSync(path.join(logsDir, 'session.log'), 'utf8')).toBe(`${logContent}\n`);
+    expect(fs.lstatSync(logsDir).isSymbolicLink()).toBe(false);
+
+    // Model consolidation of the canonical runner tree into RUNNER_TEMP/gh-aw.
+    const canonicalRoot = path.join(testDir, 'canonical-gh-aw');
+    fs.mkdirSync(path.join(canonicalRoot, 'sandbox/agent/logs'), { recursive: true });
+    fs.writeFileSync(path.join(canonicalRoot, 'artifact.txt'), 'artifact fixture');
+    fs.cpSync(canonicalRoot, runnerRoot, { recursive: true });
+    expect(fs.readFileSync(path.join(logsDir, 'session.log'), 'utf8')).toBe(`${logContent}\n`);
+    expect(fs.readFileSync(path.join(runnerRoot, 'artifact.txt'), 'utf8')).toBe('artifact fixture');
+    expect(fs.lstatSync(logsDir).isSymbolicLink()).toBe(false);
+  }, 180000);
 
   test('Test 4: Blanket mount removed with custom mounts', async () => {
     // Create a test file outside the custom mount in a secure temp directory

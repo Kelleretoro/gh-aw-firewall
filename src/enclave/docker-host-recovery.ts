@@ -3,7 +3,12 @@ import * as path from 'path';
 import { createHash, randomBytes } from 'crypto';
 import { dockerMemoryBytes, assertDockerHostPath, type DockerHostMountIdentity } from './docker-host-storage';
 
-export interface DockerHostCommandResult { exitCode: number; stdout: string }
+export interface DockerHostCommandResult {
+  exitCode: number;
+  stdout: string;
+  /** Definitive local-daemon response only; never synthesized from a timeout or transport exception. */
+  imageUnavailable?: string;
+}
 export type DockerHostCommand = (args: readonly string[], signal?: AbortSignal) => Promise<DockerHostCommandResult>;
 
 export interface DockerHostOwnerIdentity { pid: number; startTicks: string; bootId: string }
@@ -24,22 +29,27 @@ export function captureDockerHostOwner(): DockerHostOwnerIdentity {
   };
 }
 
-export function assertDockerHostOwnerStopped(owner: DockerHostOwnerIdentity | undefined, current: DockerHostOwnerIdentity): void {
+export function isDockerHostOwnerLive(owner: DockerHostOwnerIdentity | undefined, current: DockerHostOwnerIdentity): boolean {
   if (!owner || !Number.isSafeInteger(owner.pid) || owner.pid < 1
     || !/^[0-9]+$/.test(owner.startTicks) || !/^[0-9a-f-]{36}$/.test(owner.bootId)) {
     throw new Error('Docker enclave recovery lacks verified host ownership');
   }
-  // Reconciliation by this same trusted process is also guarded by the
-  // adapter's in-process active-execution registry.
-  if (owner.pid === current.pid && owner.startTicks === current.startTicks && owner.bootId === current.bootId) return;
-  if (owner.bootId !== current.bootId) return;
+  if (owner.bootId !== current.bootId) return false;
   try {
     const live = processStart(owner.pid);
-    if (live.startTicks === owner.startTicks && !['Z', 'X'].includes(live.state)) {
-      throw new Error('Docker enclave host owner is still alive');
-    }
+    return live.startTicks === owner.startTicks && !['Z', 'X'].includes(live.state);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT' && (error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+    return false;
+  }
+}
+
+export function assertDockerHostOwnerStopped(owner: DockerHostOwnerIdentity | undefined, current: DockerHostOwnerIdentity): void {
+  // Reconciliation by this same trusted process is also guarded by the
+  // adapter's in-process active-execution registry.
+  if (owner?.pid === current.pid && owner.startTicks === current.startTicks && owner.bootId === current.bootId) return;
+  if (isDockerHostOwnerLive(owner, current)) {
+    throw new Error('Docker enclave host owner is still alive');
   }
 }
 
@@ -80,6 +90,18 @@ export interface DockerHostRecoveryRecord {
   containerId?: string;
   /** No absence proof is sufficient while a daemon create may still complete. */
   createPending?: boolean;
+  /** Durable intent prevents recovery from discarding unretained public diagnostics. */
+  publicDebug?: {
+    pending: boolean;
+    retained?: boolean;
+    stage: import('./public-debug-artifacts').PublicEnclaveStage;
+    failure: import('./public-debug-artifacts').PublicEnclaveFailure;
+    exitCode: number | null;
+    stages?: import('./public-debug-events').PublicEnclaveOperationEvent[];
+    primaryFailure?: import('./public-debug-events').PublicEnclaveOperationFailure;
+    cleanupFailure?: import('./public-debug-events').PublicEnclaveOperationFailure;
+    dockerState?: { running: false; exitCode: number | null; oomKilled: boolean | null };
+  };
 }
 
 function digest(value: string): string { return createHash('sha256').update(value).digest('hex'); }
@@ -190,14 +212,16 @@ export class DockerHostRecoveryJournal {
     if ([0x01021994, 0x858458f6].includes(type)) throw new Error('Docker enclave journal must survive tmpfs cleanup');
   }
 
-  private filename(record: Pick<DockerHostRecoveryRecord, 'entryId' | 'invocationId'>): string {
-    if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(record.entryId) || !/^[0-9a-f]{16,64}$/.test(record.invocationId)) {
+  private filename(record: Pick<DockerHostRecoveryRecord, 'runId' | 'entryId' | 'invocationId'>): string {
+    if (!/^[0-9a-f]{16,64}$/.test(record.runId) || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(record.entryId)
+      || !/^[0-9a-f]{16,64}$/.test(record.invocationId)) {
       throw new Error('Invalid Docker enclave journal identity');
     }
-    return path.join(this.directory, `${this.runId}-${record.entryId}-${record.invocationId}.json`);
+    return path.join(this.directory, `${record.runId}-${record.entryId}-${record.invocationId}.json`);
   }
 
   write(record: DockerHostRecoveryRecord, exclusive = false): void {
+    if (record.runId !== this.runId) throw new Error('Docker enclave journal run identity mismatch');
     const target = this.filename(record);
     const staging = `${target}.${randomBytes(16).toString('hex')}`;
     const fd = fs.openSync(staging, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
@@ -209,8 +233,12 @@ export class DockerHostRecoveryJournal {
     } finally { if (fs.existsSync(staging)) fs.unlinkSync(staging); }
   }
 
-  records(): DockerHostRecoveryRecord[] {
-    return fs.readdirSync(this.directory).filter((name) => name.startsWith(`${this.runId}-`) && name.endsWith('.json')).map((name) => {
+  records(allRuns = false): DockerHostRecoveryRecord[] {
+    return fs.readdirSync(this.directory)
+      .filter((name) => name.endsWith('.json')
+        && (allRuns ? /^[0-9a-f]{16,64}-[a-z0-9][a-z0-9-]{0,62}-[0-9a-f]{16,64}\.json$/.test(name)
+          : name.startsWith(`${this.runId}-`)))
+      .map((name) => {
       const target = path.join(this.directory, name);
       const fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
       try {
@@ -219,7 +247,7 @@ export class DockerHostRecoveryJournal {
           throw new Error('Invalid Docker enclave recovery journal');
         }
         const record = JSON.parse(fs.readFileSync(fd, 'utf8')) as DockerHostRecoveryRecord;
-        if (record.version !== 1 || record.runId !== this.runId || this.filename(record) !== target
+        if (record.version !== 1 || (!allRuns && record.runId !== this.runId) || this.filename(record) !== target
           || (record.containerId !== undefined && !/^[0-9a-f]{64}$/.test(record.containerId))
           || record.storageSource !== `awf-enclave-${record.runId}-${record.entryId}-${record.invocationId}`
           || !Number.isSafeInteger(record.storageBytes) || record.storageBytes < 1
@@ -252,7 +280,8 @@ export async function inspectDockerHostContainer(docker: DockerHostCommand, name
   return parsed[0];
 }
 
-export async function removeDockerHostContainer(docker: DockerHostCommand, record: DockerHostRecoveryRecord): Promise<void> {
+export async function removeDockerHostContainer(docker: DockerHostCommand, record: DockerHostRecoveryRecord,
+  stopped?: (state: { running: false; exitCode: number | null; oomKilled: boolean | null }) => void): Promise<void> {
   if (!record.expected) {
     if (record.containerId) throw new Error('Docker enclave recovery lacks its immutable launch specification');
     return;
@@ -267,6 +296,12 @@ export async function removeDockerHostContainer(docker: DockerHostCommand, recor
     return;
   }
   assertDockerHostContainer(inspected, record.expected, record.containerId);
+  if (!inspected.State?.Running) stopped?.({
+    running: false, exitCode: inspected.State?.Status === 'exited' && Number.isInteger(inspected.State?.ExitCode)
+      ? inspected.State.ExitCode : null,
+    oomKilled: inspected.State?.Status === 'exited' && typeof inspected.State?.OOMKilled === 'boolean'
+      ? inspected.State.OOMKilled : null,
+  });
   if (inspected.State?.Running) {
     const killed = await docker(['kill', inspected.Id]);
     if (killed.exitCode !== 0) {

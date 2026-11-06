@@ -8,6 +8,7 @@ const { identity } = require('../../shared/model-information/identity');
 const { validate, validateRecords } = require('../../shared/model-information/contracts');
 const { importLegacySnapshot } = require('../../shared/model-information/import-legacy-snapshot');
 const schema = require('../../shared/model-information/schema.v1.json');
+const exact = require('../../shared/model-information/exact-pricing');
 
 const rootArgument = process.argv.find(arg => arg.startsWith('--root='));
 if (rootArgument && !process.argv.includes('--check')) {
@@ -21,7 +22,7 @@ if (sourceArgument && !process.argv.includes('--check')) {
 const sources = sourceArgument
   ? path.resolve(sourceArgument.slice('--source-dir='.length))
   : path.join(root, 'shared/model-information/sources');
-const compilerVersion = 4;
+const compilerVersion = 6;
 const read = file => JSON.parse(fs.readFileSync(path.join(root, file), 'utf8'));
 const sha256 = value => crypto.createHash('sha256').update(value).digest('hex');
 const json = value => `${JSON.stringify(value, null, 2)}\n`;
@@ -321,11 +322,29 @@ function compile() {
     if (model.identity.provider !== 'copilot') return [];
     const tariffs = model.tariffs || [];
     if (!tariffs.length) return [];
+    if (tariffs.some(tariff => tariff.scope.provider !== 'copilot' ||
+        tariff.scope.channel !== 'copilot-api' || tariff.scope.deployment !== undefined ||
+        tariff.currency !== 'USD' || tariff.unit !== 'USD_PER_1M_TOKENS' ||
+        !['default', 'long_context'].includes(tariff.tier) ||
+        tariff.effectiveFrom || tariff.effectiveUntil ||
+        (tariff.tier === 'long_context'
+          ? !Number.isSafeInteger(tariff.promptTokensAbove) || tariff.promptTokensAbove <= 0
+          : tariff.promptTokensAbove !== undefined) ||
+        ['input', 'cachedInput', 'cacheWrite', 'output'].some(field => !tariff.components[field]) ||
+        Object.entries(tariff.components).some(([field, item]) => {
+          if (typeof item.price === 'object') return field !== 'cacheWrite';
+          exact.decimal(item.price);
+          return false;
+        })) ||
+        tariffs.filter(tariff => tariff.tier === 'default').length !== 1 ||
+        tariffs.filter(tariff => tariff.tier === 'long_context').length > 1) {
+      throw new Error(`Unsupported maintained fallback tariff: ${model.identity.key}`);
+    }
     const name = model.identity.rawId.startsWith('claude-')
       ? model.identity.lookupId : model.identity.rawId;
     const convert = tariff => ({
       ...Object.fromEntries(Object.entries(tariff.components).map(([key, item]) =>
-        [key, typeof item.price === 'object' ? null : Number(item.price)])),
+        [key, typeof item.price === 'object' ? null : item.price])),
       ...(tariff.promptTokensAbove !== undefined ? { threshold: tariff.promptTokensAbove } : {}),
     });
     const base = tariffs.find(tariff => tariff.tier === 'default');
@@ -348,9 +367,9 @@ function compile() {
         const rate = pricing[name];
         const project = values => ({
           ...(values.threshold !== undefined ? { threshold: values.threshold } : {}),
-          input: values.input, cachedInput: values.cachedInput,
-          cacheWrite: values.cacheWrite, output: values.output,
-          reasoning: values.reasoning ?? (data.reasoningMatchesOutput ? values.output : undefined),
+          input: Number(values.input), cachedInput: Number(values.cachedInput),
+          cacheWrite: values.cacheWrite === null ? null : Number(values.cacheWrite), output: Number(values.output),
+          reasoning: Number(values.reasoning ?? (data.reasoningMatchesOutput ? values.output : undefined)),
         });
         return [name, {
           ...project(rate),
@@ -364,10 +383,66 @@ function compile() {
     model.lifecycle.replacement).map(model => [
     model.identity.rawId, model.lifecycle.replacement.split('/').slice(1).join('/'),
   ]));
+  const naming = json({
+    models: [...models].sort((a, b) =>
+      a.identity.key < b.identity.key ? -1 : a.identity.key > b.identity.key ? 1 : 0)
+      .map(model => ({ identity: model.identity })),
+    rules: [...rules].sort((a, b) =>
+      JSON.stringify(sorted(a)) < JSON.stringify(sorted(b)) ? -1 :
+        JSON.stringify(sorted(a)) > JSON.stringify(sorted(b)) ? 1 : 0),
+  });
+  const eligibility = json({
+    models: sortedModels.filter(model => model.harnesses && model.harnesses.length).map(model => ({
+      identity: model.identity, harnesses: model.harnesses,
+    })),
+  });
+  // OpenRouter namespaces identify the model publisher, not a native billing
+  // backend. Only OpenRouter's full wire ID is associated with these imports.
+  const nativeCompatibility = reference.nativeCompatibility;
+  if (nativeCompatibility?.policy !== 'legacy_native_compatibility' ||
+      nativeCompatibility.channel !== 'native-api' ||
+      !nativeCompatibility.note || !nativeCompatibility.evidence ||
+      !nativeCompatibility.additionalModels) {
+    throw new Error('pricing-reference.json: expected explicit legacy native compatibility policy');
+  }
+  const withReasoning = tier => ({ ...tier, reasoning: tier.reasoning ?? tier.output });
+  const compatibilityProviders = Object.fromEntries(Object.entries(referenceProviders).map(([provider, data]) =>
+    [provider, Object.fromEntries(Object.keys(data.models).map(name => {
+      const rate = pricing[name];
+      return [name, { ...withReasoning(rate),
+        ...(rate.longContext ? { longContext: withReasoning(rate.longContext) } : {}) }];
+    }))]));
+  for (const [provider, names] of Object.entries(nativeCompatibility.additionalModels)) {
+    if (!compatibilityProviders[provider] || !Array.isArray(names) ||
+        new Set(names).size !== names.length ||
+        names.some(name => !Object.hasOwn(pricing, name) ||
+          Object.hasOwn(compatibilityProviders[provider], name))) {
+      throw new Error(`pricing-reference.json: invalid native compatibility associations for ${provider}`);
+    }
+    for (const name of names) compatibilityProviders[provider][name] = pricing[name];
+  }
+  const fallbackPricing = {
+    catalogRevision: revision,
+    compatibility: {
+      policy: nativeCompatibility.policy, channel: nativeCompatibility.channel,
+      authority: 'policy', confidence: 'policy_fallback',
+      sourceProvenance: reference.provenance, providers: compatibilityProviders,
+    },
+    imported: {
+      openrouter: Object.fromEntries(imported.models.map(model =>
+        [model.identity.key, model.importedPricing])),
+    },
+  };
   const output = {
     [importedFile]: json(imported),
+    'shared/model-information/naming.generated.json': naming,
+    'containers/api-proxy/model-information.naming.generated.json': naming,
+    'src/model-information.naming.generated.json': naming,
     'src/model-information.compat.generated.json': json({ supported: ['auto', ...supported], retired, suggestionOrder }),
+    'src/model-information.eligibility.generated.json': eligibility,
+    'containers/api-proxy/model-information.eligibility.generated.json': eligibility,
     'containers/api-proxy/model-information.pricing.generated.json': json(pricing),
+    'containers/api-proxy/model-information.fallback-pricing.generated.json': json(fallbackPricing),
     'containers/api-proxy/model-information.retired.generated.json': json(retired),
     'containers/api-proxy/ai-credits-pricing-reference.json': json({
       schemaVersion: 1, unit: 'USD_PER_1M_TOKENS',
@@ -400,9 +475,17 @@ function compile() {
   };
   errors.push(...validate('resolvedExport', JSON.parse(output['shared/model-information/catalog.generated.json'])));
   errors.push(...validate('resolvedExport', JSON.parse(output['shared/model-information/target.generated.json'])));
-  for (const file of ['contracts.js', 'identity.js', 'schema.v1.json',
+  for (const file of ['contracts.js', 'contracts.d.ts', 'identity.js', 'identity.d.ts', 'resolution.js', 'resolution.d.ts',
+    'eligibility.js', 'eligibility.d.ts', 'harness-observation.js', 'harness-observation.d.ts',
+    'pricing-resolution.js', 'pricing-resolution.d.ts', 'exact-pricing.js', 'schema.v1.json',
     'publication.v1.schema.json', 'publication-contract.cjs', 'publication.cjs']) {
     output[`containers/api-proxy/catalogue-contract/${file}`] =
+      fs.readFileSync(path.join(root, 'shared/model-information', file), 'utf8');
+  }
+  for (const file of ['identity.js', 'identity.d.ts', 'resolution.js', 'resolution.d.ts', 'eligibility.js', 'eligibility.d.ts',
+    'harness-observation.js', 'harness-observation.d.ts', 'pricing-resolution.js', 'pricing-resolution.d.ts',
+    'exact-pricing.js']) {
+    output[`src/model-information-contract/${file}`] =
       fs.readFileSync(path.join(root, 'shared/model-information', file), 'utf8');
   }
   if (errors.length) throw new Error(errors.join('\n'));

@@ -104,7 +104,7 @@ jobs:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -166,7 +166,7 @@ jobs:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -238,7 +238,7 @@ jobs:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -315,7 +315,7 @@ jobs:
           echo "openapi_sha256=$(sha256sum containers/router/openapi.yaml | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -407,7 +407,7 @@ jobs:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -472,7 +472,7 @@ jobs:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -609,7 +609,7 @@ jobs:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -685,7 +685,7 @@ jobs:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -763,7 +763,7 @@ jobs:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1004,6 +1004,9 @@ jobs:
           echo "=== Schema preview (first 10 lines) ==="
           head -10 release/awf-config.schema.json
 
+      - name: Package host enclave storage helper
+        run: node scripts/build-enclave-storage-helper.mjs
+
       - name: Generate checksums
         run: |
           cd release
@@ -1028,6 +1031,7 @@ jobs:
             release/awf-darwin-x64
             release/awf-darwin-arm64
             release/awf-bundle.js
+            release/enclave-storage-helper.py
             release/awf.tgz
             release/checksums.txt
             release/containers.txt
@@ -1164,6 +1168,7 @@ jobs:
             release/awf-darwin-x64
             release/awf-darwin-arm64
             release/awf-bundle.js
+            release/enclave-storage-helper.py
             release/awf.tgz
             release/cloud-hypervisor-test-x86_64.tar.gz
             release/cloud-hypervisor-test-x86_64.SHA256SUMS
@@ -1263,7 +1268,7 @@ jobs:
         with:
           ref: ${{ needs.bump-version.outputs.version }}
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1325,7 +1330,7 @@ jobs:
         with:
           ref: ${{ needs.bump-version.outputs.version }}
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1396,7 +1401,7 @@ jobs:
   build-cloud-hypervisor-test-artifacts:
     name: Build Cloud Hypervisor Preview Test Artifacts
     runs-on: ubuntu-24.04
-    needs: [bump-version, build-cloud-hypervisor-guest-base, build-cloud-hypervisor-profiles]
+    needs: [bump-version, build-enclaves, build-cloud-hypervisor-guest-base, build-cloud-hypervisor-profiles]
     timeout-minutes: 60
     steps:
       - name: Checkout code
@@ -1431,7 +1436,7 @@ jobs:
           rustup --version
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1442,6 +1447,7 @@ jobs:
           GUEST_BASE_IMAGE="ghcr.io/${{ github.repository }}/cloud-hypervisor-guest-base@${{ needs.build-cloud-hypervisor-guest-base.outputs.digest }}" \
             PRIMARY_IMAGE="ghcr.io/${{ github.repository }}/cloud-hypervisor-primary@${{ needs.build-cloud-hypervisor-profiles.outputs.primary_digest }}" \
             ENCLAVE_IMAGE="ghcr.io/${{ github.repository }}/cloud-hypervisor-enclave@${{ needs.build-cloud-hypervisor-profiles.outputs.enclave_digest }}" \
+            ENCLAVE_AGENT_IMAGE="ghcr.io/${{ github.repository }}/enclave-agent@${{ needs.build-enclaves.outputs.enclave_agent_digest }}" \
             VERSION="${{ needs.bump-version.outputs.version }}" \
             AWF_CH_PRUNE_DOCKER_BUILD_CACHE=1 \
             ./guest/cloud-hypervisor/build-test-artifacts.sh
@@ -1515,9 +1521,9 @@ jobs:
       - name: Fetch and verify pinned NVX release artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NVX_RELEASE: v0.1.0-dev.be859aa77ffa
+          NVX_RELEASE: v0.1.0-dev.8fb0f1d64f2f
           NVX_ARCHIVE: nvx-0.1.0-linux-kvm.tar.gz
-          NVX_ARCHIVE_SHA256: ad6bf948d84d60d92f35103b52dc3ad33a421e9a4457ce0823d1890a6985a912
+          NVX_ARCHIVE_SHA256: 0a4bb74e76e80a524c3dccd9336b77705ef91d6a908d6979403c59151a5883da
         run: |
           set -euo pipefail
           package_dir="$RUNNER_TEMP/nvx-package"
@@ -1560,9 +1566,9 @@ jobs:
                 sourceCommit:$source_commit
               },
               upstream:{
-                releaseTag:"v0.1.0-dev.be859aa77ffa",
-                nvxCommit:"be859aa77ffa7a20f9ef50f68c5386acdfca9955",
-                openvmmCommit:"762bc1c7a203b16aee752324d6a4ab0bde1a713a"
+                releaseTag:"v0.1.0-dev.8fb0f1d64f2f",
+                nvxCommit:"8fb0f1d64f2f67e0017a4f94693244297852ed1f",
+                openvmmCommit:"0ac254109ed32fc5fa2b1a6fc526a10593b1f986"
               },
               architecture:"x86_64",
               artifacts:{

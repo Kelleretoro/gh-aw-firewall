@@ -85,6 +85,7 @@ following top-level properties. All are OPTIONAL:
 | `rateLimiting` | object | Egress rate limiting |
 | `platform` | object | GitHub platform deployment type declaration |
 | `enclaves` | object | Unified private-repository enclave subsystem (see §14) |
+| `enclaveDebugPublic` | boolean | Runtime-neutral public-only enclave diagnostic retention; defaults on only for eligible, positively verified scopes (see [public enclave debugging](cloud-hypervisor-foundation.md#public-fixture-enclave-debugging)) |
 
 Property-level constraints, types, and descriptions are defined
 normatively by `docs/awf-config.schema.json`.
@@ -223,6 +224,7 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `network.verifySbxEgress` → `--verify-sbx-egress` *(fail-closed verification that Docker sbx direct traffic cannot bypass Squid; requires the sbx runtime)*
 - `network.topologyAttach[]` → `--topology-attach <name>` *(repeatable; requires `network.isolation: true`)*
 - `apiProxy.enabled` → `--enable-api-proxy` *([DEPRECATED] API proxy is always enabled; this flag is ignored)*
+- `apiProxy.copilotTokenBroker` → `--copilot-token-broker` *(experimental, explicit boolean opt-in for renewable GitHub Copilot inference; runtime-only `GH_AW_TOKEN_BROKER_URL` and host Actions OIDC bootstrap are required; see [broker integration and backend contract](auth-matrix.md#renewable-token-broker-experimental-copilot-inference))*
 - `apiProxy.caCert` → `--api-proxy-ca-cert <path>` *(mounts an additional CA certificate into the api-proxy sidecar and sets `NODE_EXTRA_CA_CERTS` for upstream TLS verification)*
 - `apiProxy.enableTokenSteering` → `--enable-token-steering` *(maps to `AWF_ENABLE_TOKEN_STEERING`; opts into runtime and AI-credit advisory warnings; omit or set to `false` to opt out)*
 - `apiProxy.anthropicAutoCache` → `--anthropic-auto-cache`
@@ -314,7 +316,7 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `container.dockerHost` → `--docker-host`
 - `container.dockerHostPathPrefix` → `--docker-host-path-prefix`
 - `container.runnerToolCachePath` → *(config-only; checked first for optional read-only runner tool cache mount, before `RUNNER_TOOL_CACHE` and `/home/runner/work/_tool` auto-detection)*
-- `container.mounts[]` → `-v, --mount` *(repeatable; each array entry maps to one Docker volume mount in `/host_path:/container_path[:ro|rw]` format (both paths must be absolute; host path must exist); in chroot mode, container paths are automatically prefixed with `/host`)*
+- `container.mounts[]` → `-v, --mount` *(repeatable; each array entry maps to one Docker volume mount in `/host_path:/container_path[:ro|rw]` format (both paths must be absolute; host path must exist); in chroot mode, container paths are automatically prefixed with `/host`. With ARC/DinD, `--docker-host-path-prefix` translates the bind-mount host source only, not the container destination or paths in the agent command. Sysroot staging can drop automatic mounts whose sources are not daemon-visible; explicitly mount required shared paths. See [docs/arc-dind.md](./arc-dind.md#staging-recipe))*
 - `container.containerRuntime` → `--container-runtime` *(user-facing runtime name: `"gvisor"` for an OCI runtime in Compose, `"sbx"` for a Docker sbx microVM, `"cloud-hypervisor"` for the explicit Cloud Hypervisor v53.0 workload preview (GitHub-hosted Ubuntu x86_64 KVM runners only; see §4.2), or `"nvx"` for the explicit NVX/OpenVMM one-shot workload preview (Linux x86_64 KVM-only; see [docs/nvx-security-design.md](./nvx-security-design.md#runtime-registration-opt-in-preview)). gVisor translates to `"runsc"` and injects `extra_hosts` for its DNS workaround. For sbx, Cloud Hypervisor, and NVX, infrastructure stays in Compose while the primary agent runs in a microVM.)*
 - `filesystem.allowWrite[]` → *(config-only; no CLI equivalent; narrows existing writable host binds to the listed guest-visible absolute paths, see §4.1)*
 - `cloudHypervisor.previewEnabled` → `--cloud-hypervisor-preview` *(requires `container.containerRuntime: "cloud-hypervisor"` or at least one `enclaves[].runtime: "cloud-hypervisor"` entry, plus a GitHub-hosted Ubuntu x86_64 KVM runner to execute a workload)*
@@ -330,7 +332,8 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `cloudHypervisor.vcpuCount` → `--cloud-hypervisor-vcpus`
 - `cloudHypervisor.memoryMib` → `--cloud-hypervisor-memory-mib`
 - `cloudHypervisor.scratchMib` → `--cloud-hypervisor-scratch-mib` *(optional positive integer MiB; bounds primary guest `/tmp` with tmpfs before workload startup, leaving fixed enclave budgets unchanged)*
-- `cloudHypervisor.enclaveDebugPublic` → `--cloud-hypervisor-enclave-debug-public` *(defaults on for eligible attested, static public-only enclaves after positive GitHub visibility verification; set `false` in configuration to opt out; host-only bounded artifacts include agent session diagnostics; private/mixed/dynamic scopes remain default off; see [public enclave debugging](cloud-hypervisor-foundation.md#public-fixture-enclave-debugging))*
+- `enclaveDebugPublic` → *(config-only; runtime-neutral, defaults on for eligible static public-only built-in-image default Docker or attested Cloud Hypervisor enclaves after positive GitHub visibility verification; set `false` to opt out; unsupported scopes cannot enable retention; see [public enclave debugging](cloud-hypervisor-foundation.md#public-fixture-enclave-debugging))*
+- `cloudHypervisor.enclaveDebugPublic` → `--cloud-hypervisor-enclave-debug-public` *(legacy Cloud Hypervisor alias; top-level `enclaveDebugPublic` takes precedence; the alias does not enable Docker retention)*
 - `cloudHypervisor.apiTimeoutMs` → `--cloud-hypervisor-api-timeout-ms`
 - `cloudHypervisor.sha256.cloudHypervisor` → `--cloud-hypervisor-binary-sha256` *(development bypass only)*
 - `cloudHypervisor.sha256.virtiofsd` → `--cloud-hypervisor-virtiofsd-sha256`
@@ -386,6 +389,7 @@ rejected before it is executed; the CLI proxy writes a
 points, configured limit, and remaining budget.
 
 - *(no config equivalent)* → `--reflect` *(CLI-only; starts AWF, queries the API proxy `/reflect` endpoint, and prints its JSON response instead of running a command; mutually exclusive with a command argument)*
+- *(no config equivalent)* → `--input-dir <path>` *(CLI-only; repeatable; each absolute sandbox-visible path must be a non-empty, readable directory before the command runs, otherwise the run fails closed; does not grant engine file scope)*
 - *(no config equivalent)* → `--capture-command-output <directory>` *(CLI-only; captures raw command stdout/stderr into a new absolute host-only directory outside agent-visible mounts; non-TTY Compose runtimes only; see `docs/protected-command-output.md`)*
 - *(no config equivalent)* → `--capture-command-output-max-bytes <bytes>` *(CLI-only; requires `--capture-command-output`; default and maximum 67108864)*
 - `platform.type` → *(config-only; maps to `AWF_PLATFORM_TYPE`)*
@@ -820,10 +824,14 @@ A conforming implementation:
 
 1. MUST read the named variable only in runner-side configuration code, before
    any container starts.
-2. MUST require an absolute `https://` URL and MUST reject embedded credentials
+2. MUST require an absolute `http://` or `https://` URL and MUST reject embedded credentials
    (`user:pass@`), query strings, fragments, malformed hosts, unsupported
-   schemes, and non-default ports (the sidecar connects on port 443).
+   schemes, and dangerous service ports. HTTPS is recommended for remote endpoints.
 3. MUST derive the host, `host:port`, and optional base path from the URL.
+   Explicit ports MUST be preserved for discovery, validation, and inference.
+   Non-default ports MUST be authorized only for the trusted API-proxy source
+   and the exact configured DNS hostname/port, without widening agent access,
+   bypassing Squid, or overriding destination blocks.
 4. MUST add the derived destination to the effective Squid policy without
    persisting it in repository configuration, and MUST keep it out of
    `allowedDomains` (it is carried in the sensitive allowlist instead).
@@ -1197,21 +1205,29 @@ ports still serve provider-local `/health` responses.
 
 ### 10.3 Max AI Credits Configuration
 
-`maxAiCredits` is a positive number. It is supplied via the AWF config file
+`maxAiCredits` accepts a positive budget or a disabled value (`-1` or `0`).
+It is supplied via the AWF config file
 (including stdin config via `--config -`) and maps to the
 `AWF_MAX_AI_CREDITS` environment variable injected into the api-proxy
 container.
 
-When configured, the proxy MUST enforce this budget. Once cumulative AI credits reach or
+Setting `maxAiCredits` to `-1` or `0` disables the configured budget, as if the
+field were omitted. AWF does not inject `AWF_MAX_AI_CREDITS` for these values.
+Other negative values are invalid. The non-overridable 10,000-credit hard cap
+still applies.
+
+When configured, the proxy MUST enforce this budget. Once cumulative accounted AI credits reach or
 exceed `maxAiCredits`, subsequent requests MUST be rejected with HTTP `403`
 and error type `ai_credits_limit_exceeded`.
+Usage without resolvable pricing is excluded from these totals and produces a
+warning, so enforcement may undercount actual spending.
 
 When `apiProxy.enableTokenSteering` is true, cumulative credits also queue the
 80%, 90%, 95%, and 99% advisory warnings. This warning path does not alter credit
 accounting or terminal rejection.
 
 Regardless of `maxAiCredits` configuration, AWF also enforces a non-overridable
-hard cap of **10,000 AI credits**. When cumulative AI credits reach this hard
+hard cap of **10,000 accounted AI credits**. When cumulative accounted AI credits reach this hard
 cap, subsequent requests MUST be rejected with HTTP `403` and error type
 `ai_credits_limit_exceeded`, and the error/log payload MUST include
 `hard_cap: true`.
@@ -1253,16 +1269,18 @@ Legacy model names are **canonicalized** before lookup: provider prefixes
 as interchangeable. For example, `copilot/claude-sonnet-4.6`,
 `claude_sonnet_4_6`, and `claude-sonnet-4-6` all resolve to the same pricing
 entry. Version-date suffixes are also normalized. Shared-catalog entries and
-bundled pricing require an exact canonical model match; AWF does not infer a
-price from a related model-family prefix. `apiProxy.providers` retains its
+bundled pricing require an exact canonical model match; family estimates below
+do not become exact tariffs. `apiProxy.providers` retains its
 explicit longest-prefix override behavior.
 Fetched central tariffs instead match only the exact reviewed provider-qualified,
 raw or lookup identity; they do not infer aliases, date suffixes or families.
 
 If none of these sources resolves the model, the `defaultAiCreditsPricing` fallback
-(if configured) is used. If that is also absent, the request is rejected.
+(if configured) is used. If that is also absent, a concrete named model uses
+the same-backend median estimate described below, with a warning. Only usage
+with no eligible backend donors remains excluded from AI-credit totals.
 Models whose catalog entry carries zero-cost pricing are recognized as known
-models with zero AI credit impact, so they are never rejected as "unknown".
+models with zero AI credit impact and do not produce missing-pricing warnings.
 
 Tiered pricing uses the default-tier prompt threshold. When the applicable
 prompt-token count exceeds that threshold, all token categories use the
@@ -1381,32 +1399,72 @@ When configured, any model not found in the operator overlay, shared catalog,
 runtime provider metadata, curated built-in pricing table, or bundled models.dev
 catalog uses these rates as a fallback for AI credits calculation.
 
-### 10.3.3 Unknown Model Rejection
+### 10.3.3 Missing Model Pricing Warnings
 
-When `maxAiCredits` is active and the proxy encounters a request whose model
-cannot be resolved from the curated built-in pricing table or the bundled
-models.dev catalog, operator overlay, supplied catalog, or runtime provider
-metadata:
+Missing pricing does not make a model unavailable. When a request's model
+cannot be priced using provider overlays, runtime metadata, or the pricing
+catalogs:
 
 1. **If `defaultAiCreditsPricing` is configured**: the fallback rates are used
    and the request proceeds normally.
 
-2. **If `defaultAiCreditsPricing` is NOT configured**: the proxy MUST reject
-   the request with HTTP `400` and error type `unknown_model_ai_credits`. The
-   error payload includes:
-   - `model`: the unresolved model name
-   - `message`: human-readable instructions to configure
-     `apiProxy.defaultAiCreditsPricing`, add the model to
-     `apiProxy.modelPricingCatalog`, or add it to an AWF pricing table
+2. **Otherwise, for a concrete named model**: use the per-component median
+   of applicable priced members of its declared canonical family on the same
+   serving backend. If the family is unknown or has no eligible members, use
+   all applicable priced models on that backend. No manufacturer inference,
+   publisher stripping or new prefix/date family heuristic is applied.
+   The currently bundled naming catalogue declares no families; absent a
+   declared family in the captured catalogue, it therefore uses backend medians.
+   The proxy emits `estimated_model_ai_credits_pricing` once per backend/model
+   and estimate basis. Estimated usage counts toward totals, steering, the
+   configured budget and the hard cap; it is **not verified provider billing**.
 
-   This fail-closed behavior prevents unaccounted spending from models whose
-   pricing is unknown to the proxy.
+3. **If the backend has no eligible priced donors**: warn with
+   `unknown_model_ai_credits_pricing`, proceed, and exclude unpriced usage.
+   Budgets can still undercount this residual usage. Configure an explicit
+   tariff or `apiProxy.defaultAiCreditsPricing` to cover it. Missing pricing
+   does not make an explicitly requested model ineligible.
 
-Note: Requests without a `model` field in the body (e.g. non-chat endpoints)
-are not subject to this check.
+Each donor is counted once by canonical identity, using the existing source
+precedence (operator, configured catalogue, fresh provider metadata, applicable
+fresh central tariff, maintained tariff, governed import). Donors never use
+defaults, selector/sentinel policies or another estimate. Central tariffs retain
+provider/channel/deployment, effective interval and component freshness checks;
+retired/removed records and stale provider observations are excluded. Bundled
+compatibility/import facts retain their existing explicit policy provenance;
+unknown upstream observation time is not presented as fresh verification.
+Donors use the requested prompt-token tier, independently of execution discovery.
 
-**Recognized dynamic selectors.** The Copilot `auto` model (`copilot:auto`) is
-not subject to `unknown_model_ai_credits` rejection. Because its concrete
+Each component is sorted using exact rational prices. Odd counts select the
+middle value; even counts average the middle two exactly. Zero is a price;
+missing/null cache-write prices are not zero donors. Cache write remains null
+if no donor supplies it, preserving the existing unavailable-cache-write
+accounting semantics. A donor without a reasoning price uses its output rate
+before the reasoning median is calculated. Missing required input/output/cache
+read components must resolve through existing source rules, never fabricated
+zeros. Estimates can fill missing provider components without replacing supplied
+provider rates. Quiet priceability probes do not warn or mutate accounting.
+
+Reflection and token-usage records expose `pricing_source: median_estimate`,
+`accounting_policy: family_median_estimate` or `backend_median_estimate`,
+`fallback_pricing_used: true`, and estimate basis, donor/component counts and
+source kinds. `same_backend_median_v1` and a deterministic SHA-256 tariff
+fingerprint identify the estimate without exposing donor configuration.
+The nested estimate retains `tariffFingerprint` even for partial-provider fills.
+Request-pinned runtime/feed captures prevent refreshes from changing in-flight
+estimates. Accounting estimates do not rename, route or recover execution models.
+
+This behavior applies to HTTP requests and WebSocket upgrades, with or without
+`maxAiCredits`. Existing budget limits still reject requests once the accounted
+spending reaches the limit; other model policy and compatibility checks are
+unchanged.
+
+Requests without an identified model skip the request-time pricing check.
+WebSocket upgrades identify the model from the query string; response usage
+accounting also checks pricing for the reported model.
+
+**Recognized dynamic selectors.** The Copilot `auto` model (`copilot:auto`) keeps
+its existing conservative accounting. Because its concrete
 runtime model is not known at request time, the proxy accounts it using a
 conservative fallback ceiling (the maximum per-token rate across the curated
 pricing catalog) rather than rejecting the request or silently under-counting
@@ -1414,8 +1472,8 @@ spend. Token-usage records for these requests set `pricing_source` and
 `accounting_policy` to `dynamic_selector_fallback`, `pricing_tier` to
 `conservative`, `fallback_pricing_used` to `true`, and `dynamic_selector` to
 `copilot:auto`. This dynamic-selector accounting path applies only to the
-recognized Copilot `auto` selector; other unresolved models still follow the
-fallback/rejection behavior above.
+recognized Copilot `auto` selector; other unresolved models follow the
+fallback/warning behavior above.
 
 ### 10.3.4 Token Usage JSONL Schema Extensions
 
@@ -2266,8 +2324,18 @@ response whose client closed the connection before AWF finished writing is
 recorded as `client_closed`, not `aborted`, only after the upstream sent its
 protocol terminal success event (`response.completed`, `message_stop`, or
 the Chat Completions `[DONE]` sentinel) and no stream error; it MUST NOT be
-reported as a provider failure. Any other premature closure on the selected
-model remains `aborted` and fails the routed run with `provider_unavailable`. When token usage is
+reported as a provider failure. A client cancellation before terminal success
+remains `aborted` and MUST NOT itself be reported as a provider failure or as
+successful completion. Genuine upstream resets, SSE errors, and clean upstream
+EOF without streaming terminal success remain failure evidence.
+Primary-request failures MUST remain provisional until all observed responses
+and SSE inspection drain. A later fully completed 2xx request (or `client_closed`
+after protocol terminal success) on the same selected provider and model
+recovers an earlier failure in fully inspected response-completion order.
+Another provider/model, preliminary HTTP 200, or cancellation MUST NOT recover
+a failure. Only an unrecovered failure publishes the terminal private runtime
+failure and primary `stage: "failure"` record; failed request telemetry MUST
+remain intact. Independent nonzero harness exits MUST remain nonzero. When token usage is
 available, `request_id` MUST correlate with the corresponding
 `token-usage.jsonl` record; not every rejected or aborted call produces usage.
 A `failed` request record MUST include `error_code` and `error_type` when an
@@ -2593,8 +2661,17 @@ enclaves:
 ```
 
 - **Script executor** — an entry keyed by `script`; launches a no-network, read-only, single-use Python sandbox. An empty `script: {}` object is valid and selects AWF's pinned defaults.
-- **Agent executor** — an entry keyed by `agent`; launches a bounded single-use Copilot enclave. `agent.model` is REQUIRED. Optional `agent.tools.github` (or the deprecated legacy `agent.github.cli: issues-read-v1` marker; the two are mutually exclusive) adds compiler-owned shared mcpg as the only additional peer.
+- **Agent executor** — an entry keyed by `agent`; launches bounded single-use Copilot, Codex, or Claude. `agent.model` is REQUIRED. Codex requires `agent.profile: openai` and Claude requires `agent.profile: anthropic`; neither receives real provider credentials. GitHub MCP and dynamic repository admission currently require Copilot. Optional Copilot `agent.tools.github` (or the deprecated legacy `agent.github.cli: issues-read-v1` marker; the two are mutually exclusive) adds compiler-owned shared mcpg as the only additional peer.
 - **Entry-level controls** — `runtime`, `image`, `memoryLimit`, `cpuLimit`, `pidsLimit`, `tmpfsLimit`, `maxOutputBytes`, and `maxInvocations` apply to the entry's selected executor. `script.maxScriptBytes` and agent `maxTaskBytes`, `maxModelRequests`, and `maxModelTokens` remain executor-specific. Network and interpreter are AWF-owned invariants, not input fields.
+
+Docker enclaves support an unprivileged AWF host process (`gh-aw --rootless`)
+using the version-matched, narrowly authorized storage helper from `install.sh`;
+this does **not** support a rootless Docker daemon. Helper-backed `tmpfsLimit`
+has a hard 4 GiB host-allocation ceiling. Preflight requires noninteractive
+helper authorization and private host-only allocation paths; no configuration
+or environment variable may select another helper or weaken mount/network
+checks. See [unprivileged Docker orchestration](enclaves-architecture.md#unprivileged-awf-orchestration-with-rootful-docker)
+for installation, ownership and recovery requirements.
 
 At most one entry MAY exist per executor kind, and each entry MUST declare exactly one executor key. Every entry's `repos` list is merged into one trusted repository catalog: a repository shared by both entries MUST declare the same `sensitivity`, because sensitivity fixes one shared per-run information budget that both executors debit.
 
@@ -2639,11 +2716,36 @@ GitHub tools lacking a scoped executor bearer handoff are rejected.
 No unavailable configuration falls back to another runtime.
 
 An enclave-only `cloud-hypervisor` selection does not implicitly switch the
-primary agent: with a default Docker primary it is now rejected as a backend
-mismatch. Existing host-executor machinery is retained for subsequent
-same-backend lifecycle integration; it is not a supported mixed-backend run.
+primary agent. A static Cloud Hypervisor agent enclave may run under a Docker
+primary, provided every enabled enclave executor uses Cloud Hypervisor.
+Other backend mismatches still fail closed, and general all-VM primary-agent
+execution with enclaves retains its separate acceptance gates.
+
+Static GitHub tools on VM agents require the trusted compiler's
+`AWF_ENCLAVE_GITHUB_EXECUTOR_CAPABILITY` handoff and a gateway enforcing that
+capability's run/executor identity, exact tools, repositories, integrity policy
+and expiry. AWF consumes this host-only handoff before spawning children and
+exports only the scoped bearer to the guest's private read-only session handoff.
+There is no identity-only or gateway-wide-key fallback. See the
+[capability contract and lifetime](enclaves-architecture.md#cloud-hypervisor-scoped-executor-capability)
+for the closed JSON format, one-hour lifetime bound, cleanup obligations and
+compiler/gateway coordination. gh-aw v1.0.1 does not implement this contract.
 
 The agent executor additionally requires `enableApiProxy`, a configured provider route for its fixed engine/profile, a configured `model`, and the absence of `enableDind`. AWF validates those requirements before repository staging.
+
+**Public diagnostic retention:** top-level `enclaveDebugPublic` is an OPTIONAL
+boolean, not an enclave-entry field or MCP argument. An omitted value defaults on
+only for homogeneous built-in-image default Docker or attested Cloud Hypervisor
+static public-only executors. Every repository MUST have declared `public`
+sensitivity and positive credential-free GitHub visibility verification before
+capture. `false` disables retention; explicit `true` MUST NOT authorize private,
+mixed, dynamic, custom-image, runsc or unattested development scopes.
+Unavailable or unverified metadata disables capture without changing execution.
+Top-level values override the legacy Cloud Hypervisor-only
+`cloudHypervisor.enclaveDebugPublic` alias, including `false`.
+The protected, bounded four-file diagnostic envelope MUST NOT enter normal
+audit uploads, workload mounts or the canonical result channel. See the
+[retention, operator-path and controlled-sharing contract](cloud-hypervisor-foundation.md#public-fixture-enclave-debugging).
 
 ### 14.1a Dynamic repository admission (agent-only)
 

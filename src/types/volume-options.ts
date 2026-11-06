@@ -31,6 +31,9 @@ export interface VolumeOptions {
    */
   volumeMounts?: string[];
 
+  /** Sandbox-visible input directories that must be non-empty and readable. */
+  inputDirs?: string[];
+
   /**
    * Guest-visible absolute paths that may remain writable.
    *
@@ -64,9 +67,11 @@ export interface VolumeOptions {
    * When not specified, logs are written to ${workDir}/squid-logs during
    * runtime and moved to /tmp/squid-logs-<timestamp> after cleanup.
    *
-   * Note: This only affects Squid proxy logs. Agent logs (e.g., from
-   * Copilot CLI --log-dir) are handled separately and always preserved
-   * to /tmp/awf-agent-logs-<timestamp>.
+   * This does not select an agent log directory. Default ~/.copilot/logs
+   * are backed by workDir/agent-logs and preserved to
+   * /tmp/awf-agent-logs-<timestamp> when non-empty during cleanup.
+   * An explicit Copilot --log-dir writes to its own sandbox path; consumers
+   * must read the runner-visible source of the corresponding mount.
    *
    * @example '/tmp/my-proxy-logs'
    */
@@ -84,7 +89,7 @@ export interface VolumeOptions {
    *
    * Artifacts include:
    * - squid.conf: The generated Squid proxy configuration
-   * - docker-compose.redacted.yml: Container orchestration config (secrets redacted)
+   * - docker-compose.redacted.yml: Compose snapshot with environment values hidden by default
    * - policy-manifest.json: Structured description of all firewall rules
    * - iptables-audit.txt: Captured iptables state from the agent container
    *
@@ -147,7 +152,8 @@ export interface VolumeOptions {
    * - `<container>.log`: stdout+stderr from `docker logs`
    * - `<container>.state`: exit code and error string from `docker inspect`
    * - `<container>.mounts.json`: volume mount info from `docker inspect`
-   * - `docker-compose.yml`: generated compose file with TOKEN/KEY/SECRET values redacted
+   * - `docker-compose.yml`: compose snapshot with environment values hidden by default, except
+   *   exact bounded control and protocol values
    *
    * Containers inspected: awf-squid, awf-agent, awf-api-proxy, awf-iptables-init.
    * Containers that never started (e.g. api-proxy when not enabled) are silently skipped.

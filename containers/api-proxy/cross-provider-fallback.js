@@ -160,6 +160,10 @@ async function buildCrossProviderRequest({
     url: endpoint,
     headers: req.headers,
     awfRequestContext: req.awfRequestContext,
+    awfEligibility: req.awfEligibility,
+    awfEligibilityScope: req.awfEligibilityScope,
+    awfCatalogue: req.awfCatalogue,
+    awfRuntimePricing: req.awfRuntimePricing,
   };
 
   let body;
@@ -206,7 +210,7 @@ async function buildCrossProviderRequest({
 
   const filteredReq = { headers: filterHeadersForTarget(req.headers, endpoint.endsWith('/messages')) };
   const headers = buildRequestHeaders(body, -1, filteredReq, {
-    injectHeaders: adapter.getAuthHeaders(req) || {},
+    injectHeaders: await adapter.getAuthHeaders(req) || {},
     provider: targetProvider,
     targetHost,
     requestId,

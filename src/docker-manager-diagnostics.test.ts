@@ -2,6 +2,7 @@ import { preserveIptablesAudit } from './artifact-preservation';
 import { collectDiagnosticLogs } from './diagnostic-collector';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as yaml from 'js-yaml';
 import { resolveEnclavePaths } from './enclave/paths';
 
 import { mockExecaFn, mockExecaSync } from './test-helpers/mock-execa.test-utils';
@@ -58,8 +59,9 @@ describe('docker-manager diagnostics', () => {
       expect(sanitizedCompose).toContain('[REDACTED]');
       expect(sanitizedCompose).not.toContain('ghp_abc123');
       expect(sanitizedCompose).not.toContain('mykey');
-      expect(sanitizedCompose).toContain('secretvalue');
-      expect(sanitizedCompose).toContain('NORMAL_VAR: normalvalue');
+      expect(sanitizedCompose).not.toContain('secretvalue');
+      expect(sanitizedCompose).not.toContain('normalvalue');
+      expect(sanitizedCompose).toContain('NORMAL_VAR:');
     });
 
     it('should not write log file when docker logs returns empty output', async () => {
@@ -71,6 +73,35 @@ describe('docker-manager diagnostics', () => {
       const files = fs.existsSync(diagnosticsDir) ? fs.readdirSync(diagnosticsDir) : [];
       const logFiles = files.filter(f => f.endsWith('.log'));
       expect(logFiles).toHaveLength(0);
+    });
+
+    it.each([false, true])('omits encoded authentication policy from failure diagnostics (list env=%s)', async listEnv => {
+      mockExecaFn.mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 });
+      const squid = [
+        'acl broker dstdom_regex -i -n ^broker\\.internal$',
+        'acl oidc dstdomain pipelines.actions.githubusercontent.com',
+      ].join('\n');
+      const values = {
+        AWF_SQUID_CONFIG_B64: Buffer.from(squid).toString('base64'),
+        GH_AW_TOKEN_BROKER_URL: 'https://broker.internal/mint',
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://pipelines.actions.githubusercontent.com/idtoken',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'test-bootstrap',
+      };
+      fs.writeFileSync(path.join(getDir(), 'docker-compose.yml'), yaml.dump({
+        services: { squid: { environment: listEnv
+          ? Object.entries(values).map(([key, value]) => `${key}=${value}`)
+          : values } },
+      }));
+
+      await collectDiagnosticLogs(getDir());
+      const diagnosticCopy = fs.readFileSync(path.join(getDir(), 'diagnostics', 'docker-compose.yml'), 'utf8');
+      for (const value of Object.values(values)) expect(diagnosticCopy).not.toContain(value);
+      const parsed = yaml.load(diagnosticCopy) as {
+        services: { squid: { environment: Record<string, string> | string[] } };
+      };
+      const environment = parsed.services.squid.environment;
+      expect(Array.isArray(environment) ? environment[0] : environment.AWF_SQUID_CONFIG_B64)
+        .toBe(listEnv ? 'AWF_SQUID_CONFIG_B64=[REDACTED]' : '[REDACTED]');
     });
 
     it('should skip docker-compose.yml sanitization when file does not exist', async () => {
@@ -108,7 +139,8 @@ describe('docker-manager diagnostics', () => {
       expect(sanitized).not.toContain('ghp_lowercase');
       expect(sanitized).not.toContain('mixedcase_value');
       expect(sanitized).not.toContain('uppercase_secret');
-      expect(sanitized).toContain('not_sensitive: keepme');
+      expect(sanitized).not.toContain('keepme');
+      expect(sanitized).toContain('not_sensitive:');
     });
 
     it('should never copy the model router\'s logs into diagnostics', async () => {
@@ -188,7 +220,7 @@ describe('docker-manager diagnostics', () => {
         [
           'cp',
           'awf-enclave-mcp-server:/var/log/awf-enclave/enclave.jsonl',
-          path.join(auditDir, 'enclave.jsonl'),
+          expect.stringMatching(new RegExp(`/proc/${process.pid}/fd/\\d+/enclave.jsonl$`)),
         ],
         expect.objectContaining({ reject: false }),
       );
@@ -197,7 +229,7 @@ describe('docker-manager diagnostics', () => {
         [
           'cp',
           'awf-enclave-mcp-server:/var/log/awf-enclave/runtime-telemetry.jsonl',
-          path.join(auditDir, 'enclave-runtime.jsonl'),
+          expect.stringMatching(new RegExp(`/proc/${process.pid}/fd/\\d+/enclave-runtime.jsonl$`)),
         ],
         expect.objectContaining({ reject: false }),
       );
@@ -206,7 +238,7 @@ describe('docker-manager diagnostics', () => {
         [
           'cp',
           'awf-enclave-mcp-server:/var/log/awf-enclave/enclave-host-executor.jsonl',
-          path.join(auditDir, 'enclave-host-executor.jsonl'),
+          expect.stringMatching(new RegExp(`/proc/${process.pid}/fd/\\d+/enclave-host-executor.jsonl$`)),
         ],
         expect.objectContaining({ reject: false }),
       );
@@ -215,7 +247,7 @@ describe('docker-manager diagnostics', () => {
         [
           'cp',
           'awf-enclave-mcp-server:/var/log/awf-enclave/sessions',
-          path.join(auditDir, 'enclave-agent-sessions'),
+          expect.stringMatching(new RegExp(`/proc/${process.pid}/fd/\\d+/enclave-agent-sessions$`)),
         ],
         expect.objectContaining({ reject: false }),
       );
@@ -253,7 +285,11 @@ describe('docker-manager diagnostics', () => {
 
       expect(mockExecaSync).toHaveBeenCalledWith(
         'docker',
-        ['cp', 'awf-enclave-mcp-server:/var/log/awf-enclave/enclave.jsonl', path.join(auditDir, 'enclave.jsonl')],
+        [
+          'cp',
+          'awf-enclave-mcp-server:/var/log/awf-enclave/enclave.jsonl',
+          expect.stringMatching(new RegExp(`/proc/${process.pid}/fd/\\d+/enclave.jsonl$`)),
+        ],
         expect.objectContaining({ reject: false }),
       );
       expect(mockExecaSync).toHaveBeenCalledWith(
@@ -261,7 +297,7 @@ describe('docker-manager diagnostics', () => {
         [
           'cp',
           'awf-enclave-mcp-server:/var/log/awf-enclave/runtime-telemetry.jsonl',
-          path.join(auditDir, 'enclave-runtime.jsonl'),
+          expect.stringMatching(new RegExp(`/proc/${process.pid}/fd/\\d+/enclave-runtime.jsonl$`)),
         ],
         expect.objectContaining({ reject: false }),
       );

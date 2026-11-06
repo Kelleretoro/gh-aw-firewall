@@ -6,11 +6,12 @@ import * as yaml from 'js-yaml';
 
 const root = path.resolve(__dirname, '../..');
 const script = path.join(root, 'scripts/ci/configure-docker-mirror.sh');
-const syft = 'anchore/syft:v1.54.1@sha256:3eb5379ba7b409c3f4069b686110527af0c47df993fa5c10d13e7cf34f49b1aa';
+const syft = 'anchore/syft:v1.55.0@sha256:4cc92b64ca74ffca4c94d4c8fcc01f217731375300be14d0b6eeb2e82eaa110a';
 const grype = 'ghcr.io/anchore/grype@sha256:fd4ab4d1042b522c896e73bdf09ab8bf384fa417df99d6dd0d6e1008c7e7c821';
 const grant = 'ghcr.io/anchore/grant@sha256:172463611795f43b77302cdfbd7b3f81295492a7330e0820cfe41c3674920237';
 
 interface Step {
+  id?: string;
   name?: string;
   run?: string;
   uses?: string;
@@ -20,9 +21,21 @@ interface Step {
   'continue-on-error'?: boolean;
 }
 
-function jobs(file: string): Record<string, { steps: Step[] }> {
+interface Job {
+  name?: string;
+  needs?: string[];
+  if?: string;
+  outputs?: Record<string, string>;
+  strategy?: {
+    'fail-fast': boolean;
+    matrix: { scan: string[] };
+  };
+  steps: Step[];
+}
+
+function jobs(file: string): Record<string, Job> {
   return (yaml.load(fs.readFileSync(path.join(root, '.github/workflows', file), 'utf8')) as {
-    jobs: Record<string, { steps: Step[] }>;
+    jobs: Record<string, Job>;
   }).jobs;
 }
 
@@ -43,15 +56,20 @@ describe('CI registry retrieval', () => {
     expect(buildTools).toContain('test "$(gosu nobody id -u)" = 65534');
   });
 
-  it.each(['success', 'base-build', 'agent-build', 'scan', 'save'])(
-    'retains the shared PR base through dependent builds and cleans up on %s',
-    (failure) => {
-      const step = jobs('supply-chain-scan.yml').scan.steps.find(
+  it.each([
+    ['success', '2026-11-04'],
+    ['success', '2026-11-05'],
+    ...['base-build', 'agent-build', 'cache-export', 'scan', 'save']
+      .map(failure => [failure, '2026-11-04']),
+  ])(
+    'retains the shared PR base through dependent builds and cleans up on %s (%s)',
+    (failure, day) => {
+      const step = jobs('supply-chain-scan.yml')['image-scans'].steps.find(
         (entry) => entry.name?.startsWith('Build and scan PR container images'),
       )!;
       const python = step.run!.split("<<'PYEOF'\n")[1].split('\nPYEOF')[0];
       const result = spawnSync('python3', ['-c', `
-import contextlib, io, json, os, subprocess, sys
+import contextlib, datetime, io, json, os, subprocess, sys
 from unittest.mock import patch
 code = sys.stdin.read()
 live = set()
@@ -60,17 +78,25 @@ cache = set()
 calls = []
 saves = []
 failure = sys.argv[1]
+class Clock(datetime.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls.fromisoformat(sys.argv[2]).replace(tzinfo=tz)
 base = 'awf-pr-scan-build-tools:pr'
 agent = 'awf-pr-scan-enclave-agent:pr'
 def run(args, **kwargs):
     calls.append(args)
     rc = 0
-    if args[:2] == ['docker', 'build']:
+    if args[:3] == ['docker', 'buildx', 'build']:
         tag = args[args.index('-t') + 1]
         if tag == agent and base not in live:
             raise AssertionError('base removed before enclave-agent build')
         cache.add(tag)
-        if (failure == 'base-build' and tag == base) or (failure == 'agent-build' and tag == agent):
+        if failure == 'cache-export':
+            # Buildx may load the result before the remote cache exporter fails.
+            live.add(tag)
+        if ((failure == 'base-build' and tag == base) or (failure == 'agent-build' and tag == agent)
+                or (failure == 'cache-export' and tag == 'awf-pr-scan-api-proxy:pr')):
             rc = 1
         else:
             live.add(tag)
@@ -94,7 +120,8 @@ def run(args, **kwargs):
         raise AssertionError('unexpected image/system prune: ' + ' '.join(args))
     return subprocess.CompletedProcess(args, rc)
 exit_code = 0
-with patch('subprocess.run', run), patch.dict(os.environ, {'GRYPE_DB': '/tmp/mock-db'}), \\
+with patch('subprocess.run', run), patch('datetime.datetime', Clock), \\
+     patch.dict(os.environ, {'GRYPE_DB': '/tmp/mock-db'}), \\
      patch('os.path.exists', lambda file: file in archives), patch('os.remove', archives.remove):
     with contextlib.redirect_stdout(io.StringIO()):
         try:
@@ -105,7 +132,7 @@ with patch('subprocess.run', run), patch.dict(os.environ, {'GRYPE_DB': '/tmp/moc
             exit_code = error.returncode
 print(json.dumps({'live': sorted(live), 'archives': sorted(archives), 'cache': sorted(cache),
                   'saves': saves, 'calls': calls, 'exit': exit_code}))
-`, failure], { cwd: root, input: python, encoding: 'utf8' });
+`, failure, day], { cwd: root, input: python, encoding: 'utf8' });
       expect(result.stderr).toBe('');
       expect(result.status).toBe(0);
       const trace = JSON.parse(result.stdout) as {
@@ -127,13 +154,31 @@ print(json.dumps({'live': sorted(live), 'archives': sorted(archives), 'cache': s
       }
       expect(trace.exit).toBe(failure === 'success' ? 0 : failure === 'scan' ? 2 : 1);
       const agentBuild = trace.calls.find((args) =>
-        args[1] === 'build' && args.includes('awf-pr-scan-enclave-agent:pr'));
+        args[1] === 'buildx' && args.includes('awf-pr-scan-enclave-agent:pr'));
       if (failure === 'base-build' || failure === 'save') {
         expect(agentBuild).toBeUndefined();
       } else {
         expect(agentBuild).toBeDefined();
       }
       const scans = trace.calls.filter((args) => args[1] === 'run');
+      const builds = trace.calls.filter((args) => args[1] === 'buildx');
+      expect(builds.length).toBeGreaterThan(0);
+      const scopes = new Set<string>();
+      for (const args of builds) {
+        const tag = args[args.indexOf('-t') + 1];
+        const name = tag.slice('awf-pr-scan-'.length, -':pr'.length);
+        const scope = `supply-chain-v1-${name}-${day}`;
+        scopes.add(scope);
+        expect(args).toContain('--load');
+        expect(args[args.indexOf('--cache-from') + 1]).toBe(`type=gha,version=2,scope=${scope}`);
+        expect(args[args.indexOf('--cache-to') + 1]).toBe(`type=gha,version=2,mode=max,scope=${scope}`);
+        expect(args.includes('--pull')).toBe(name !== 'enclave-agent');
+        expect(args.join(' ')).not.toMatch(/ignore-error|no-cache/);
+      }
+      expect(scopes.size).toBe(builds.length);
+      if (agentBuild) {
+        expect(agentBuild).toContain('BUILD_TOOLS_IMAGE=awf-pr-scan-build-tools:pr');
+      }
       for (const args of scans) {
         expect(args).toContain(grype);
         expect(args.slice(args.indexOf('--fail-on'), args.indexOf('--fail-on') + 2))
@@ -142,6 +187,121 @@ print(json.dumps({'live': sorted(live), 'archives': sorted(archives), 'cache': s
       if (failure === 'success' || failure === 'scan') {
         expect(scans).toHaveLength(9);
       }
+      if (failure === 'cache-export') {
+        expect(scans).toHaveLength(8);
+        expect(scans.flat()).not.toContain('docker-archive:/tmp/awf-pr-scan-api-proxy.tar');
+      }
+    },
+  );
+
+  it('sets up an external-cache-capable Docker driver before pulling scanners', () => {
+    const workflow = jobs('supply-chain-scan.yml');
+    const steps = workflow['image-scans'].steps;
+    const mirror = steps.findIndex(step => step.name === 'Configure Docker Hub cache');
+    expect(steps[mirror].env?.AWF_DOCKER_CONTAINERD_SNAPSHOTTER)
+      .toBe("${{ matrix.scan == 'pr-images' && 'true' || 'false' }}");
+    const setup = steps.findIndex(step => step.name === 'Set up Docker Buildx for cached PR builds');
+    expect(setup).toBeGreaterThan(mirror);
+    expect(setup).toBeLessThan(steps.findIndex(step => step.run?.startsWith('docker pull')));
+    expect(steps[setup].uses)
+      .toBe('docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069');
+    expect(steps[setup].with?.driver).toBe('docker');
+    expect(steps[setup].if).toBe("matrix.scan == 'pr-images'");
+    expect(steps[setup]['continue-on-error']).toBeUndefined();
+    expect(workflow.compile.steps.some(step => step.env?.AWF_DOCKER_CONTAINERD_SNAPSHOTTER))
+      .toBe(false);
+  });
+
+  it.each(['complete', 'missing-token', 'missing-url'])(
+    'masks the runtime token and fails closed on missing Buildx cache credentials (%s)',
+    state => {
+      const step = jobs('supply-chain-scan.yml')['image-scans'].steps.find(
+        entry => entry.name === 'Expose GitHub Actions cache runtime for Buildx CLI',
+      )!;
+      expect(step.if).toBe("matrix.scan == 'pr-images'");
+      expect(step.uses).toBe('actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3');
+      const result = spawnSync(process.execPath, ['-e', `
+const calls = [];
+const core = {
+  setSecret: value => calls.push(['mask', value]),
+  exportVariable: (name, value) => calls.push(['export', name, value]),
+};
+const env = {
+  ...(process.argv[1] === 'missing-token' ? {} : { ACTIONS_RUNTIME_TOKEN: 'fixture-token' }),
+  ...(process.argv[1] === 'missing-url' ? {} : { ACTIONS_RESULTS_URL: 'https://cache.example/' }),
+};
+try {
+  new Function('core', 'process', ${JSON.stringify(step.with?.script)})(core, { env });
+} catch (error) {
+  process.exitCode = 1;
+}
+console.log(JSON.stringify(calls));
+`, state], { encoding: 'utf8' });
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(state === 'complete' ? 0 : 1);
+      const calls = JSON.parse(result.stdout) as string[][];
+      if (state !== 'missing-token') {
+        expect(calls.slice(0, 2)).toEqual([
+          ['mask', 'fixture-token'],
+          ['export', 'ACTIONS_RUNTIME_TOKEN', 'fixture-token'],
+        ]);
+      }
+      if (state === 'complete') {
+        expect(calls).toHaveLength(3);
+        expect(calls[2]).toEqual(['export', 'ACTIONS_RESULTS_URL', 'https://cache.example/']);
+      }
+    },
+  );
+
+  it.each(['success', 'warm-failure', 'chown-failure'])(
+    'repairs Grype cache ownership and traversal before saving (%s)',
+    failure => {
+      const steps = jobs('supply-chain-scan.yml')['image-scans'].steps;
+      const warm = steps.findIndex(step => step.name === 'Warm Grype vulnerability DB');
+      expect(steps[warm + 1].name).toBe('Save Grype vulnerability DB cache');
+      const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'awf-grype-cache-'));
+      const db = path.join(temp, 'db');
+      try {
+        fs.writeFileSync(path.join(temp, 'docker'), `#!/usr/bin/env bash
+set -euo pipefail
+echo docker >> "$TRACE"
+[[ "$FAILURE" != warm-failure ]] || exit 100
+mkdir -p "$GRYPE_DB/6"
+echo fixture-db > "$GRYPE_DB/6/vulnerability.db"
+chmod 0500 "$GRYPE_DB/6"
+chmod 0400 "$GRYPE_DB/6/vulnerability.db"
+`, { mode: 0o755 });
+        fs.writeFileSync(path.join(temp, 'sudo'), `#!/usr/bin/env bash
+set -euo pipefail
+echo "$*" >> "$TRACE"
+[[ "$1" == chown && "$2" == -R && "$3" == "$(id -u):$(id -g)" && "$4" == "$GRYPE_DB" ]]
+[[ "$FAILURE" != chown-failure ]] || exit 101
+`, { mode: 0o755 });
+        const result = spawnSync('bash', ['-e', '-c', steps[warm].run!], {
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            PATH: `${temp}${path.delimiter}${process.env.PATH}`,
+            GRYPE_DB: db,
+            TRACE: path.join(temp, 'trace'),
+            FAILURE: failure,
+          },
+        });
+        expect(result.stderr).toBe('');
+        expect(result.status).toBe(failure === 'success' ? 0 : failure === 'warm-failure' ? 100 : 101);
+        const trace = fs.readFileSync(path.join(temp, 'trace'), 'utf8').trim().split('\n');
+        expect(trace).toHaveLength(failure === 'warm-failure' ? 1 : 2);
+        if (failure === 'success') {
+          expect(trace[1]).toBe(`chown -R ${process.getuid!()}:${process.getgid!()} ${db}`);
+          expect(fs.statSync(path.join(db, '6')).mode & 0o700).toBe(0o700);
+          expect(fs.statSync(path.join(db, '6/vulnerability.db')).mode & 0o600).toBe(0o600);
+          const archive = spawnSync('tar', ['-cf', path.join(temp, 'cache.tar'), '-C', db, '.']);
+          expect(archive.status).toBe(0);
+        }
+      } finally {
+        if (fs.existsSync(path.join(db, '6'))) fs.chmodSync(path.join(db, '6'), 0o700);
+        fs.rmSync(temp, { recursive: true, force: true });
+      }
     },
   );
 
@@ -149,30 +309,35 @@ print(json.dumps({'live': sorted(live), 'archives': sorted(archives), 'cache': s
     ...Object.keys(jobs('test-chroot.yml')).map((job) => ['test-chroot.yml', job]),
     ['test-examples.yml', 'test-examples'],
     ['test-cloud-hypervisor.yml', 'build-test-artifacts'],
-    ['supply-chain-scan.yml', 'scan'],
+    ['supply-chain-scan.yml', 'compile'],
+    ['supply-chain-scan.yml', 'image-scans'],
   ];
 
   it.each(affected)('configures the runner mirror before Docker use in %s / %s', (file, job) => {
     const steps = jobs(file)[job].steps;
     const setup = steps.findIndex((step) => step.run === 'bash scripts/ci/configure-docker-mirror.sh');
-    const docker = steps.findIndex((step) => step.run?.includes('docker '));
+    const docker = steps.findIndex((step) => step.run?.includes('docker ')
+      || step.uses === './.github/actions/build-chroot-images');
     expect(setup).toBeGreaterThanOrEqual(0);
     expect(setup).toBeLessThan(docker);
     expect(steps[setup].if).toBeUndefined();
     expect(steps[setup]['continue-on-error']).toBeUndefined();
   });
 
-  it('prepares exact scanners once before compilation and retains the blocking scan', () => {
-    const steps = jobs('supply-chain-scan.yml').scan.steps;
-    const prepare = steps.findIndex((step) => step.name === 'Prepare pinned scanners');
-    const compile = steps.findIndex((step) => step.run?.includes('gh aw compile --syft'));
+  it('prepares exact scanners on their runners and retains the blocking scan', () => {
+    const workflow = jobs('supply-chain-scan.yml');
+    const compileSteps = workflow.compile.steps;
+    const prepare = compileSteps.findIndex((step) => step.name === 'Prepare pinned Syft scanner');
+    const compile = compileSteps.findIndex((step) => step.run?.includes('gh aw compile --syft'));
     expect(prepare).toBeGreaterThanOrEqual(0);
     expect(prepare).toBeLessThan(compile);
-    for (const image of [syft, grype, grant]) {
+    expect(compileSteps[prepare].run).toContain(`docker pull ${syft}`);
+    expect(compileSteps[prepare]['continue-on-error']).toBeUndefined();
+    const steps = workflow['image-scans'].steps;
+    for (const image of [grype, grant]) {
       expect(image).toMatch(/@sha256:[a-f0-9]{64}$/);
-      expect(steps[prepare].run).toContain(`docker pull ${image}`);
+      expect(steps.some((step) => step.run?.includes(`docker pull ${image}`))).toBe(true);
     }
-    expect(steps[prepare]['continue-on-error']).toBeUndefined();
     const blocking = steps.find((step) => step.name?.startsWith('Build and scan PR container images'));
     expect(blocking?.run).toContain(grype);
     expect(blocking?.run).toContain("'--fail-on', 'high'");
@@ -185,34 +350,157 @@ print(json.dumps({'live': sorted(live), 'archives': sorted(archives), 'cache': s
     expect(blocking?.['continue-on-error']).toBeUndefined();
     const free = steps.findIndex((step) => step.name === 'Free unused hosted-runner disk space');
     expect(free).toBeGreaterThanOrEqual(0);
-    expect(free).toBeLessThan(prepare);
+    expect(free).toBeLessThan(steps.findIndex((step) => step.run?.includes('docker pull')));
+    expect(steps[free].if).toBe("matrix.scan == 'pr-images'");
     expect(steps[free].run).not.toContain('docker');
     expect(steps[free].run).not.toContain('hostedtoolcache/go');
     expect(steps.find((step) => step.run?.includes(`'${grant}'`))?.run).toContain(grant);
   });
 
   it('builds the reviewed patched compiler before scanning', () => {
-    const steps = jobs('supply-chain-scan.yml').scan.steps;
+    const steps = jobs('supply-chain-scan.yml').compile.steps;
     const install = steps.findIndex(
-      (step) => step.name === 'Install patched gh-aw v0.93.4',
+      (step) => step.name === 'Install patched gh-aw v1.0.1',
     );
     const compile = steps.findIndex((step) =>
-      step.run === 'gh aw compile --syft --action-mode action --action-tag v0.93.4 .github/workflows/*.md');
+      step.run === 'gh aw compile --syft --action-mode action --action-tag v1.0.1 .github/workflows/*.md');
     expect(install).toBeGreaterThanOrEqual(0);
     expect(compile).toBeGreaterThan(install);
-    expect(steps[install - 2].name).toBe('Checkout gh-aw v0.93.4');
-    expect(steps[install - 2].with?.ref).toBe('3de7cc191d85f95a65e5d64d2e386539ed7a36be');
+    expect(steps[install - 2].name).toBe('Checkout gh-aw v1.0.1');
+    expect(steps[install - 2].with?.ref).toBe('0627fdbe4beb5f3b71aa569f8d97150b87f2111a');
     expect(steps[install].run).toContain('compiler-agent-acceptance-v0.28.66.patch');
     expect(steps[install].run).toContain('go test -C .tmp/gh-aw-compiler ./pkg/workflow');
     expect(steps[install].run).toContain('./pkg/parser');
     expect(steps[install].run).toContain('TestMainWorkflowSchemaOrdinaryEnclaveTokenLimitAndEvals');
-    expect(steps[install].run).toContain('dev-v0.93.4-agent-acceptance-v0.28.66-budget131072');
+    expect(steps[install].run).toContain('dev-v1.0.1-agent-acceptance-v0.28.66-budget131072');
     expect(steps[install].run).toContain('gh aw version');
     expect(steps[install].env?.GH_TOKEN).toBe('${{ github.token }}');
     for (const index of [install, compile]) {
       expect(steps[index].if).toBeUndefined();
       expect(steps[index]['continue-on-error']).toBeUndefined();
     }
+  });
+
+  it('fans scans out after one compilation without cancelling sibling scans', () => {
+    const workflow = jobs('supply-chain-scan.yml');
+    const scans = workflow['image-scans'];
+    expect(scans.needs).toEqual(['compile']);
+    expect(scans.strategy).toEqual({
+      'fail-fast': false,
+      matrix: { scan: ['pr-images', 'published-cves', 'licenses'] },
+    });
+    const selectors = [
+      ['Build and scan PR container images', "matrix.scan == 'pr-images'"],
+      ['Scan published & third-party images', "matrix.scan == 'published-cves'"],
+      ['Check image licenses', "matrix.scan == 'licenses'"],
+    ];
+    for (const [prefix, selector] of selectors) {
+      const step = scans.steps.find((entry) => entry.name?.startsWith(prefix))!;
+      expect(step.if).toBe(selector);
+      expect(step['continue-on-error']).toBeUndefined();
+      if (prefix !== 'Build and scan PR container images') {
+        expect(step.env?.MANIFEST_IMAGES).toBe('${{ needs.compile.outputs.images }}');
+        expect(step.run).toContain("json.loads(os.environ['MANIFEST_IMAGES'])");
+        expect(step.run).toContain('sys.exit(0)');
+      }
+    }
+    const databaseSteps = scans.steps.filter((step) => step.name?.includes('Grype vulnerability DB'));
+    expect(databaseSteps).toHaveLength(3);
+    for (const step of databaseSteps) {
+      expect(step.if).toBe("matrix.scan != 'licenses'");
+      if (step.with) {
+        expect(step.with.key).toBe('grype-db-v6-${{ github.run_id }}-${{ matrix.scan }}');
+      }
+    }
+    expect(workflow.compile.outputs?.images).toBe('${{ steps.inventory.outputs.images }}');
+    expect(Object.values(workflow).flatMap((job) => job.steps)
+      .filter((step) => step.run?.includes('gh aw compile --syft'))).toHaveLength(1);
+  });
+
+  it.each([0, 1])('passes the compiled inventory to both report-only scans (scanner exit %i)', (scannerExit) => {
+    const workflow = jobs('supply-chain-scan.yml');
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'awf-scan-inventory-'));
+    try {
+      const workflows = path.join(temp, '.github/workflows');
+      fs.mkdirSync(workflows, { recursive: true });
+      const pinned = 'example.com/agent@sha256:' + 'a'.repeat(64);
+      fs.writeFileSync(path.join(workflows, 'first.lock.yml'), '# gh-aw-manifest: ' + JSON.stringify({
+        containers: [{ image: 'example.com/agent:latest', pinned_image: pinned }],
+      }));
+      fs.writeFileSync(path.join(workflows, 'second.lock.yml'), '# gh-aw-manifest: ' + JSON.stringify({
+        containers: [{ pinned_image: pinned }, { image: 'example.com/helper:v1' }],
+      }));
+      fs.writeFileSync(path.join(workflows, 'ordinary.lock.yml'), 'name: ordinary workflow\n');
+      const inventory = workflow.compile.steps.find((step) => step.id === 'inventory')!;
+      const output = path.join(temp, 'output');
+      const result = spawnSync('bash', ['-e', '-c', inventory.run!], {
+        cwd: temp,
+        encoding: 'utf8',
+        env: { ...process.env, GITHUB_OUTPUT: output },
+      });
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(0);
+      const images = JSON.parse(fs.readFileSync(output, 'utf8').trim().slice('images='.length)) as string[];
+      expect(images).toEqual([pinned, 'example.com/helper:v1']);
+      for (const prefix of ['Scan published & third-party images', 'Check image licenses']) {
+        const step = workflow['image-scans'].steps.find((entry) => entry.name?.startsWith(prefix))!;
+        const python = step.run!.split("<<'PYEOF'\n")[1].split('\nPYEOF')[0];
+        const scan = spawnSync('python3', ['-c', `
+import contextlib, io, json, subprocess, sys
+from unittest.mock import patch
+calls = []
+def run(args, **kwargs):
+    calls.append(args)
+    return subprocess.CompletedProcess(args, int(sys.argv[1]))
+output = io.StringIO()
+with patch('subprocess.run', run), contextlib.redirect_stdout(output):
+    try:
+        exec(compile(sys.stdin.read(), '<workflow>', 'exec'))
+    except SystemExit as error:
+        exit_code = error.code
+print(json.dumps({'calls': calls, 'exit': exit_code, 'output': output.getvalue()}))
+`, String(scannerExit)], {
+          cwd: temp,
+          input: python,
+          encoding: 'utf8',
+          env: { ...process.env, GRYPE_DB: '/tmp/mock-db', MANIFEST_IMAGES: JSON.stringify(images) },
+        });
+        expect(scan.stderr).toBe('');
+        expect(scan.status).toBe(0);
+        const trace = JSON.parse(scan.stdout) as { calls: string[][]; exit: number; output: string };
+        expect(trace.exit).toBe(0);
+        expect(trace.calls).toHaveLength(images.length);
+        const isGrype = prefix.startsWith('Scan published');
+        trace.calls.forEach((args, index) => {
+          expect(args).toContain(isGrype ? grype : grant);
+          expect(args).toContain(isGrype ? `registry:${images[index]}` : images[index]);
+        });
+        expect(trace.output.includes('::warning::')).toBe(scannerExit !== 0);
+      }
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['success', 'success', 0],
+    ['failure', 'success', 1],
+    ['success', 'failure', 1],
+    ['success', 'cancelled', 1],
+    ['cancelled', 'skipped', 1],
+  ])('preserves the required check for compile=%s scans=%s', (compile, scans, status) => {
+    const gate = jobs('supply-chain-scan.yml').scan;
+    expect(gate.name).toBe('Compile + Syft/Grype/Grant');
+    expect(gate.needs).toEqual(['compile', 'image-scans']);
+    expect(gate.if).toBe('always()');
+    expect(gate.steps[0].env).toEqual({
+      COMPILE_RESULT: '${{ needs.compile.result }}',
+      SCANS_RESULT: '${{ needs.image-scans.result }}',
+    });
+    const result = spawnSync('bash', ['-e', '-c', gate.steps[0].run!], {
+      env: { ...process.env, COMPILE_RESULT: compile, SCANS_RESULT: scans },
+    });
+    expect(result.status).toBe(status);
   });
 });
 
@@ -236,7 +524,11 @@ esac
     fs.writeFileSync(path.join(temp, 'docker'), `#!/usr/bin/env bash
 set -euo pipefail
 echo docker >> "$TRACE"
-printf '%s\\n' "\${DOCKER_MIRRORS:-[\\"https://mirror.gcr.io/\\"]}"
+if [[ "$*" == *DriverStatus* ]]; then
+  printf '%s\\n' "\${DRIVER_STATUS:-[[\\"driver-type\\",\\"io.containerd.snapshotter.v1\\"]]}"
+else
+  printf '%s\\n' "\${DOCKER_MIRRORS:-[\\"https://mirror.gcr.io/\\"]}"
+fi
 `, { mode: 0o755 });
   });
 
@@ -281,6 +573,31 @@ printf '%s\\n' "\${DOCKER_MIRRORS:-[\\"https://mirror.gcr.io/\\"]}"
     expect(JSON.parse(fs.readFileSync(path.join(temp, 'daemon.json'), 'utf8'))).toEqual({
       'registry-mirrors': ['https://mirror.gcr.io'],
     });
+  });
+
+  it('opts into the containerd store without losing other daemon features', () => {
+    fs.writeFileSync(path.join(temp, 'daemon.json'), JSON.stringify({
+      features: { other: true, 'containerd-snapshotter': false },
+    }));
+    expect(run({ AWF_DOCKER_CONTAINERD_SNAPSHOTTER: 'true' }).status).toBe(0);
+    expect(JSON.parse(fs.readFileSync(path.join(temp, 'daemon.json'), 'utf8'))).toEqual({
+      features: { other: true, 'containerd-snapshotter': true },
+      'registry-mirrors': ['https://mirror.gcr.io'],
+    });
+    expect(fs.readFileSync(path.join(temp, 'trace'), 'utf8').trim().split('\n').slice(-2))
+      .toEqual(['docker', 'docker']);
+  });
+
+  it('does not silently proceed with an unsupported external cache store', () => {
+    expect(run({
+      AWF_DOCKER_CONTAINERD_SNAPSHOTTER: 'true',
+      DRIVER_STATUS: '[["Backing Filesystem","extfs"]]',
+    }).status).not.toBe(0);
+  });
+
+  it('rejects invalid snapshotter settings before restarting Docker', () => {
+    expect(run({ AWF_DOCKER_CONTAINERD_SNAPSHOTTER: 'yes' }).status).not.toBe(0);
+    expect(fs.readFileSync(path.join(temp, 'trace'), 'utf8')).not.toContain('systemctl');
   });
 
   it.each(['not-json', '[]', '{"registry-mirrors":42}'])('rejects invalid config %s without restarting', (config) => {

@@ -15,8 +15,6 @@ import {
   SESSION_STATE_DIR,
   legacyApiProxyLogsDirRegex,
   copilotModelOverrideRegex,
-  copySessionStateSentinel,
-  copySessionStateStepRegex,
   copilotCliDaemonCopyStepRegex,
   copilotCliDaemonCopyStepSentinel,
   compiledEngineIdRegex,
@@ -39,7 +37,6 @@ import {
 import {
   buildLocalInstallSteps,
   buildBranchEnclaveInstallSteps,
-  buildCopySessionStateStep,
   buildCopilotCliDaemonCopyStep,
   buildStripExecBitsStep,
   buildScanInjectionStep,
@@ -58,6 +55,8 @@ const publishedAwfWorkflowLockFiles = new Set([
   'auth-doctor-updater.lock.yml',
   'doc-maintainer.lock.yml',
   'model-api-mapping-updater.lock.yml',
+  'pr-sous-chef.lock.yml',
+  'mount-docs-maintainer.lock.yml',
   'schema-sync.lock.yml',
   'self-hosted-runner-doctor-updater.lock.yml',
   'update-release-notes.lock.yml',
@@ -80,6 +79,39 @@ export function applyGeneralWorkflowPatches(
   workflowPath: string
 ): PatchResult {
   const log: string[] = [];
+  if (workflowPath.endsWith('workflow-runtime-auditor.lock.yml')) {
+    const exclusions = [
+      'GH_AW_DEFAULT_OTLP_HEADERS',
+      'GH_AW_OTLP_ENDPOINTS',
+      'OTEL_EXPORTER_OTLP_HEADERS',
+      'OTEL_EXPORTER_OTLP_ENDPOINT',
+    ];
+    let commandCount = 0;
+    content = content.split('\n').map(line => {
+      if (!/^\s*awf --config\b/.test(line) || !line.includes('--env-all')) return line;
+      commandCount++;
+      for (const name of exclusions) {
+        if (!line.includes(`--exclude-env ${name}`)) {
+          line = line.replace('--env-all', `--env-all --exclude-env ${name}`);
+        }
+      }
+      return line;
+    }).join('\n');
+    if (commandCount < 2) {
+      throw new Error(`Expected both AWF sandbox commands in ${workflowPath}`);
+    }
+    log.push('  Excluded OTLP credentials from both auditor sandboxes');
+  }
+
+  const preparedSmokeImages = /(?:^|[/\\])smoke-(?:claude|copilot(?:-network-isolation)?|services)\.lock\.yml$/.test(workflowPath)
+    && content.includes('- name: Build local AWF smoke images\n');
+  const preparedSmokeImageArgs =
+    '--image-registry awf-smoke --image-tag "${AWF_SMOKE_IMAGE_TAG:?}" --skip-pull';
+  // Normalize our prior output before the shared local-build transforms for idempotency.
+  if (preparedSmokeImages) {
+    content = content.split(preparedSmokeImageArgs).join('--build-local');
+    content = content.split(JSON.stringify(preparedSmokeImageArgs).slice(1, -1)).join('--build-local');
+  }
 
   const manifest = content.match(/^# gh-aw-manifest: (.+)$/m);
   if (manifest && (JSON.parse(manifest[1]) as { admission?: boolean }).admission === false) {
@@ -535,6 +567,37 @@ export function applyGeneralWorkflowPatches(
         log.push(`  Removed ${localAwfImageMatches.length} local AWF image download(s)`);
       }
     }
+    if (preparedSmokeImages) {
+      // Authored steps precede compiler setup; identity helpers need the local CLI build first.
+      const preparation = content.match(
+        /^ {6}- name: Build local AWF smoke images\n(?: {8}.*\n|\n)*/m,
+      );
+      const localInstall = /^ {6}- name: Install awf binary \(local\)\n(?: {8}.*\n|\n)*/m;
+      if (!preparation || !localInstall.test(content)) {
+        throw new Error('Smoke image preparation requires the local AWF install step');
+      }
+      const preserveHelperStep =
+        '      - name: Preserve smoke image preparation helper\n' +
+        '        run: |\n' +
+        '          mkdir -p "${RUNNER_TEMP}/awf-smoke"\n' +
+        '          cp "${GITHUB_WORKSPACE}/scripts/ci/build-smoke-images.sh" "${RUNNER_TEMP}/awf-smoke/build-smoke-images.sh"\n';
+      if (!content.includes(preserveHelperStep)) {
+        const prCheckout = /^      - name: Checkout PR branch\n        id: checkout-pr\n/m;
+        if (!prCheckout.test(content)) {
+          throw new Error('Smoke image preparation requires the PR checkout step');
+        }
+        content = content.replace(prCheckout, `${preserveHelperStep}$&`);
+      }
+      content = content.replace(preparation[0], '');
+      content = content.replace(localInstall, step => step + preparation[0]);
+      content = content.split('\n').map(line => line.replace(
+        /--build-local\b/g,
+        /^\s*run: "/.test(line)
+          ? JSON.stringify(preparedSmokeImageArgs).slice(1, -1)
+          : preparedSmokeImageArgs,
+      )).join('\n');
+      log.push('  Reused prepared PR images outside the smoke execution budget');
+    }
   }
 
   // Inject --session-state-dir into AWF invocations so Copilot CLI session-state
@@ -590,21 +653,6 @@ export function applyGeneralWorkflowPatches(
   }
 
   // Claude Code: no --ignore-scripts injection (needs postinstall for native binary)
-
-  // Replace the "Copy Copilot session state files to logs" step with an inline
-  // script that reads from the AWF-managed session-state path instead of
-  // $HOME/.copilot/session-state (which is empty when Copilot CLI ran inside
-  // the AWF Docker container).
-  if (!content.includes(copySessionStateSentinel)) {
-    const copyMatch = content.match(copySessionStateStepRegex);
-    if (copyMatch) {
-      const indent = copyMatch[1];
-      content = content.replace(copySessionStateStepRegex, buildCopySessionStateStep(indent));
-      log.push(`  Replaced 'Copy Copilot session state' step with AWF-path inline script`);
-    }
-  } else {
-    log.push(`  'Copy Copilot session state' step already updated`);
-  }
 
   // Rewrite the compiler-emitted "Copy Copilot CLI to daemon-visible path"
   // step (firewall + arc-dind) so it is gated on the compiled engine. gh-aw
@@ -853,7 +901,7 @@ export function applyGeneralWorkflowPatches(
   );
 
   if (isCloudHypervisorEnclaveSmoke || isCloudHypervisorAgentEnclaveSmoke) {
-    // gh-aw v0.93.4 discards agentConfig to force a privileged enclave install,
+    // gh-aw v1.0.1 discards agentConfig to force a privileged enclave install,
     // also dropping its manifest pin. Restore only this reviewed release pair.
     const unpinnedEnclaveInstall =
       /(^[ \t]*run: bash "\$\{RUNNER_TEMP\}\/gh-aw\/actions\/install_awf_binary\.sh" v0\.28\.66)(?=\r?$)/gm;
@@ -872,17 +920,34 @@ export function applyGeneralWorkflowPatches(
       /^( {6}- name: Redact secrets in logs\n)( {8}if: always\(\)\n)/gm,
       '$1        id: redact_secrets\n$2',
     );
-    const invocation = 'sudo --preserve-env awf --config ';
-    const debugInvocation = 'sudo --preserve-env awf --cloud-hypervisor-enclave-debug-public --config ';
-    if (content.split(debugInvocation).length > 2 ||
-        (content.includes(debugInvocation) && content.includes(invocation))) {
+    const invocationPairs = [
+      {
+        normal: 'sudo --preserve-env awf --config ',
+        debug: 'sudo --preserve-env awf --cloud-hypervisor-enclave-debug-public --config ',
+      },
+      {
+        normal: '/usr/local/bin/awf --config ',
+        debug: '/usr/local/bin/awf --cloud-hypervisor-enclave-debug-public --config ',
+      },
+    ];
+    const countOccurrences = (value: string, needle: string): number =>
+      value.split(needle).length - 1;
+    const normalCount = invocationPairs.reduce(
+      (count, pair) => count + countOccurrences(content, pair.normal), 0);
+    const debugCount = invocationPairs.reduce(
+      (count, pair) => count + countOccurrences(content, pair.debug), 0);
+    if (debugCount > 1 || (debugCount === 1 && normalCount > 0)) {
       throw new Error('Expected exactly one trusted host AWF invocation for public enclave debug');
     }
-    if (!content.includes(debugInvocation)) {
-      if (content.split(invocation).length !== 2) {
+    if (debugCount === 0) {
+      if (normalCount !== 1) {
         throw new Error('Expected exactly one trusted host AWF invocation for public enclave debug');
       }
-      content = content.replace(invocation, debugInvocation);
+      const pair = invocationPairs.find(({ normal }) => content.includes(normal));
+      if (!pair) {
+        throw new Error('Could not identify trusted host AWF invocation for public enclave debug');
+      }
+      content = content.replace(pair.normal, pair.debug);
       log.push('  Enabled public enclave debug on the effective host AWF invocation');
     }
     // The compiler substitutes the repository retention variable even for custom uploads.

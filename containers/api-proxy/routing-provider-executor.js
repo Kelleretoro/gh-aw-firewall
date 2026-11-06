@@ -5,6 +5,7 @@ const { getCurrentGuardChecks } = require('./proxy-guards');
 const { parseModelEndpointBlockedFromBody, parseModelNotSupportedFromBody } = require('./upstream-response');
 const { createRoutingError } = require('./routing-errors');
 const { isNativeAdapter } = require('./routing-catalogue');
+const { evaluateModelEligibility, buildEligibilityError } = require('./model-eligibility');
 
 const MAX_CLASSIFIER_RESPONSE_BYTES = 1_048_576;
 
@@ -82,13 +83,18 @@ function createRoutingProviderExecutor({
     throw createRoutingError('routing_configuration_error', 'The routing provider executor is incomplete');
   }
   return Object.freeze({
-    checkBeforePrimary({ selection }) {
+    checkBeforePrimary({ selection, awfEligibility, awfEligibilityScope }) {
       for (const guard of getGuardChecks(selection.wire_model, selection.provider || 'copilot')) {
         if (!guard.isBlocked(guard.block)) continue;
         const envelope = guard.buildError(guard.block);
         const error = envelope?.error || envelope;
         const code = error?.type || error?.code || guard.eventName;
         throw createRoutingError(code, error?.message || `Model routing is blocked by ${code}`);
+      }
+      const decision = evaluateModelEligibility(selection.wire_model, selection.provider || 'copilot', { awfEligibility, awfEligibilityScope },
+        { inputMode: 'native' });
+      if (!decision.admitted) {
+        throw createRoutingError('no_route', buildEligibilityError(decision).error.message);
       }
     },
 
@@ -108,6 +114,8 @@ function createRoutingProviderExecutor({
       req.complete = false;
       req.headers = { accept: 'application/json', 'content-type': 'application/json', 'content-length': String(body.length) };
       req.awfRequestContext = Object.freeze({ purpose: 'routing_classification', signal });
+      req.awfEligibility = request.awfEligibility;
+      req.awfEligibilityScope = request.awfEligibilityScope;
       const res = new BufferedResponse(MAX_CLASSIFIER_RESPONSE_BYTES);
       return new Promise((resolve, reject) => {
         let settled = false;
@@ -130,13 +138,21 @@ function createRoutingProviderExecutor({
         signal?.addEventListener('abort', onAbort, { once: true });
         res.once('error', error => settle(reject, error));
         res.once('finish', () => settle(resolve, normalizeResult(res.result())));
-        try {
-          if (checkRateLimit(req, res, provider, body.length)) return;
+        const dispatch = (headers) => {
+          if (settled) return;
           proxyRequest(
-            req, res, adapter.getTargetHost(req), adapter.getAuthHeaders(req), provider,
+            req, res, adapter.getTargetHost(req), headers, provider,
             adapter.getBasePath(req), null, adapter.getRequestSigner ? adapter.getRequestSigner() : null,
             adapter.getTargetScheme ? adapter.getTargetScheme(req) : 'https',
           );
+        };
+        try {
+          if (checkRateLimit(req, res, provider, body.length)) return;
+          if (adapter.renewableAuth) {
+            adapter.getAuthHeaders(req).then(dispatch).catch(error => settle(reject, error));
+          } else {
+            dispatch(adapter.getAuthHeaders(req));
+          }
         } catch (error) {
           settle(reject, error);
         }

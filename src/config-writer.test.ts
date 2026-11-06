@@ -8,9 +8,11 @@ jest.mock('execa', () => ({
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as yaml from 'js-yaml';
 import execa from 'execa';
 import { writeConfigs } from './config-writer';
-import { generateDockerCompose } from './compose-generator';
+import { generateDockerCompose, redactDockerComposeSecrets } from './compose-generator';
+import type { DockerComposeConfig } from './types';
 import { isOpenSslAvailable } from './ssl-bump';
 import { getRealUserHome, isNativeRootWithoutSudo } from './host-identity';
 import {
@@ -76,6 +78,43 @@ describe('writeConfigs', () => {
   });
 
   describe('network subnet override', () => {
+    it('passes effective API proxy upstreams to both Squid and the policy manifest', async () => {
+      await writeConfigs(buildWriteConfig(tempDir, {
+        enableApiProxy: true,
+        openaiApiTarget: 'http://gateway.example:11434',
+        anthropicApiTarget: 'https://secure.example:8443',
+      }));
+      const { generateSquidConfig, generatePolicyManifest } = jest.requireMock('./squid-config');
+      const expected = expect.objectContaining({
+        apiProxyUpstreams: [
+          { hostname: 'gateway.example', port: 11434 },
+          { hostname: 'secure.example', port: 8443 },
+        ],
+      });
+      expect(generateSquidConfig).toHaveBeenCalledWith(expected);
+      expect(generatePolicyManifest).toHaveBeenCalledWith(expected);
+    });
+
+    it('does not add upstream exceptions when API proxy is disabled', async () => {
+      await writeConfigs(buildWriteConfig(tempDir, { openaiApiTarget: 'gateway.example:11434' }));
+      const { generateSquidConfig, generatePolicyManifest } = jest.requireMock('./squid-config');
+      expect(generateSquidConfig.mock.calls[0][0].apiProxyUpstreams).toBeUndefined();
+      expect(generatePolicyManifest.mock.calls[0][0].apiProxyUpstreams).toBeUndefined();
+    });
+
+    it('redacts secret-derived upstream hosts from the policy audit artifact', async () => {
+      const { generatePolicyManifest } = jest.requireMock('./squid-config');
+      generatePolicyManifest.mockReturnValueOnce({ upstream: 'private.example', port: 8443 });
+      await writeConfigs(buildWriteConfig(tempDir, {
+        enableApiProxy: true,
+        openaiApiTarget: 'private.example:8443',
+        sensitiveAllowedDomains: ['https://private.example'],
+      }));
+      const manifest = fs.readFileSync(path.join(tempDir, 'audit', 'policy-manifest.json'), 'utf8');
+      expect(manifest).not.toContain('private.example');
+      expect(manifest).toContain('[REDACTED]');
+    });
+
     it('relocates the awf-net subnet and sidecar IPs passed to compose generation', async () => {
       await writeConfigs(buildWriteConfig(tempDir, { networkSubnet: '10.88.0.0/24' }));
 
@@ -440,10 +479,9 @@ describe('writeConfigs', () => {
       const chrootToolCacheDir = path.join(chrootWorkDir, '_tool');
       expect(fs.existsSync(chrootToolCacheDir)).toBe(true);
       expect(fs.statSync(chrootToolCacheDir).isDirectory()).toBe(true);
-      expect(fs.chownSync).toHaveBeenCalledWith(chrootWorkDir, 1000, 1000);
-      expect(fs.chmodSync).toHaveBeenCalledWith(chrootWorkDir, 0o755);
-      expect(fs.chownSync).toHaveBeenCalledWith(chrootToolCacheDir, 1000, 1000);
-      expect(fs.chmodSync).toHaveBeenCalledWith(chrootToolCacheDir, 0o755);
+      expect(fs.fchownSync).toHaveBeenCalledWith(expect.any(Number), 1000, 1000);
+      expect(fs.statSync(chrootWorkDir).mode & 0o777).toBe(0o755);
+      expect(fs.statSync(chrootToolCacheDir).mode & 0o777).toBe(0o755);
     });
 
     it('does not create .gemini directory when geminiApiKey is not provided', async () => {
@@ -482,6 +520,66 @@ describe('writeConfigs', () => {
       expect(sensitivePathAudit.maskedPaths[0].targets)
         .toEqual(['/tmp/gh-aw/mcp-logs', '/host/tmp/gh-aw/mcp-logs']);
       expect(sensitivePathAudit.exemptions[0].path).toBe('/tmp/gh-aw/mcp-payloads');
+    });
+
+    it('writes default-hidden audit values without changing the runnable compose file', async () => {
+      const environment = {
+        GH_AW_OTLP_ENDPOINTS: '[{"url":"https://collector.example","headers":"authorization=collector-canary"}]',
+        DATABASE_URL: 'postgresql://db.example/database?password=database-canary',
+        FUTURE_SETTING: 'opaque-canary ${warning.title} $NAME $$',
+        AWF_CHROOT_ENABLED: 'true',
+        OTEL_EXPORTER_OTLP_PROTOCOL: 'http/protobuf',
+      };
+      const compose: DockerComposeConfig = {
+        services: {
+          'api-proxy': {
+            container_name: 'awf-api-proxy',
+            image: 'api-proxy:test',
+            environment,
+            ports: ['10000:10000'],
+          },
+        },
+        networks: {},
+      };
+      const original = JSON.stringify(compose);
+      jest.mocked(generateDockerCompose).mockReturnValueOnce(compose);
+      const actual = jest.requireActual<typeof import('./compose-generator')>('./compose-generator');
+      jest.mocked(redactDockerComposeSecrets).mockImplementationOnce(actual.redactDockerComposeSecrets);
+
+      await writeConfigs(buildWriteConfig(tempDir));
+
+      const runtime = fs.readFileSync(path.join(tempDir, 'docker-compose.yml'), 'utf8');
+      const audit = fs.readFileSync(path.join(tempDir, 'audit', 'docker-compose.redacted.yml'), 'utf8');
+      expect(yaml.load(runtime)).toEqual({
+        ...compose,
+        services: {
+          'api-proxy': {
+            ...compose.services['api-proxy'],
+            environment: {
+              ...environment,
+              FUTURE_SETTING: 'opaque-canary $${warning.title} $$NAME $$$$',
+            },
+          },
+        },
+      });
+      expect(audit).not.toContain('canary');
+      expect(yaml.load(audit)).toEqual({
+        ...compose,
+        services: {
+          'api-proxy': {
+            ...compose.services['api-proxy'],
+            environment: {
+              GH_AW_OTLP_ENDPOINTS: '[REDACTED]',
+              DATABASE_URL: '[REDACTED]',
+              FUTURE_SETTING: '[REDACTED]',
+              AWF_CHROOT_ENABLED: 'true',
+              OTEL_EXPORTER_OTLP_PROTOCOL: 'http/protobuf',
+            },
+          },
+        },
+      });
+      expect(JSON.stringify(compose)).toBe(original);
+      expect(fs.statSync(path.join(tempDir, 'docker-compose.yml')).mode & 0o777).toBe(0o600);
     });
 
     it('records NVX sensitive paths as deferred rather than applied', async () => {

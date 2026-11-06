@@ -51,6 +51,12 @@ VM. Every API request has a bounded timeout and response-size limit.
 
 ## Host components
 
+Host tools must be root-owned, non-writable regular executables with trusted,
+non-symlink ancestor directories. The resolver prefers verified `PATH` entries.
+For `id` only, if none passes, it also verifies
+`/usr/lib/cargo/bin/coreutils/id`, Ubuntu 26.04's physical uutils applet,
+without accepting the `/usr/bin/id` symlink or relaxing those trust checks.
+
 The implementation is divided into focused modules:
 
 - `src/cloud-hypervisor-runtime-backend.ts` implements the external agent
@@ -171,8 +177,11 @@ record is removed while the requested resources remain preserved.
 
 ### Public-fixture enclave debugging
 
-For attested, static **public-only** Cloud Hypervisor enclaves, AWF retains logs
-by default. This includes script stdout/stderr, VM diagnostics, and the agent's
+For eligible, static **public-only** enclaves, AWF retains protected diagnostics
+by default after positive repository-visibility verification. Eligible runtimes
+are built-in-image default Docker and attested Cloud Hypervisor; this is not
+permission to use custom images or alternative Docker runtimes. Cloud Hypervisor
+retention includes script stdout/stderr, VM diagnostics, and the agent's
 bounded `enclave-session.log`: Copilot stdout/stderr and failure diagnostics
 captured by the guest entrypoint, with credential redaction. It is captured
 after confirmed VM stop, before invocation storage is removed, including failed
@@ -180,21 +189,21 @@ invocations. The session is limited to 1 MiB and never included in the ordinary
 audit projection. A failed protected write prevents removal of the source
 storage and reports incomplete cleanup.
 
-Private, mixed-sensitivity, dynamic, custom-image, development, and other-runtime
-configurations retain their existing default-discard behavior. Set
-`cloudHypervisor.enclaveDebugPublic: false` to opt out, or explicitly request
-public-only retention with `--cloud-hypervisor-enclave-debug-public` or this
-top-level configuration alongside the existing enclave and attested
-Cloud Hypervisor configuration:
+Private, mixed-sensitivity, dynamic, custom-image, development, runsc, and
+unsupported-runtime configurations remain default-discard. Set top-level
+`enclaveDebugPublic: false` to opt out, or `true` to explicitly request retention
+alongside an eligible enclave configuration. For example:
 
 ```json
 {
-  "cloudHypervisor": {
-    "previewEnabled": true,
-    "enclaveDebugPublic": true
-  }
+  "enclaveDebugPublic": true
 }
 ```
+
+The legacy `cloudHypervisor.enclaveDebugPublic` and
+`--cloud-hypervisor-enclave-debug-public` remain Cloud Hypervisor-only aliases.
+The runtime-neutral top-level setting takes precedence, including an explicit
+`false`; the legacy alias cannot enable Docker retention.
 
 Retention does not open any production rollout gate or enable a different
 runtime. Every configured repository must have `sensitivity: "public"`. AWF also
@@ -214,21 +223,97 @@ transport codes. Response bodies, headers, repository names, and raw transport
 errors are not included. A `403` alone does not establish rate limiting, and
 an unknown transport code must not be treated as a diagnosed network cause.
 Explicit requests for dynamic repository admission, non-public sensitivities (including `trusted`),
-custom enclave images, unattested development artifacts, and non-Cloud-Hypervisor
-executors are rejected. A guest request, payload, or environment variable cannot
+custom enclave images, unattested development artifacts, runsc, and unsupported
+or heterogeneous executors are rejected. A guest request, payload, or environment variable cannot
 enable capture.
 
-Artifacts persist outside the work directory under
-`/var/lib/awf-cloud-hypervisor/debug-artifacts/cloud-hypervisor/<opaque-invocation-id>/`.
-AWF checks this root against primary-agent mounts and actual virtio-fs exports,
+The common invocation envelope uses four fixed filenames: `stdout.log`, `stderr.log`,
+`enclave-session.log`, and `diagnostics.json`. The workload's source
+`session.jsonl` is not the retained artifact name. Its versioned metadata records run,
+invocation, executor and runtime identity; lifecycle stage and fixed failure
+classification; actual workload exit code (or `null` before execution); verified
+workload-stop proof; and each stream's collection status. Script sessions are
+`not-applicable`. Missing, unsafe, oversized and unreadable files are classified
+explicitly; they are not published as successful captures. Docker inspect,
+network and VM evidence availability is explicit, and unavailable counters must
+not be invented or used to diagnose a root cause.
+The bounded `stages` array contains at most 64 fixed operation events covering
+storage preparation/probing, network isolation, authority handoff, workload creation/start,
+entrypoint initialization, workload exit, output validation and cleanup.
+Events distinguish started, succeeded, failed and unavailable/not-applicable
+observations, with allowlisted error categories and numeric errno only—never
+exception messages. `primaryFailure` preserves the original failed operation;
+an independently observed `cleanupFailure` does not overwrite it. Absent failure
+fields do not substitute for cleanup proof. `stopProof: "not-launched"` explicitly
+distinguishes setup failure from `stopProof: "verified"` after workload stop.
+Available Docker evidence is a closed stopped/exit/OOM summary; Cloud Hypervisor
+counters can be explicitly supplemental rather than pretending identical backend
+instrumentation exists.
+Nonzero workload exits use the common `stage: "execution"` classification;
+network membership checks use `network-isolation`, not `storage-probe`.
+Pending public diagnostic recovery preserves its source and reports the affected
+run separately without blocking unrelated runs. Reusing the affected Docker run
+still requires trusted recovery with the original credential custody.
+For agents, read the envelope's `streamCoverage` metadata alongside stream
+availability: `enclave-session.log` contains captured Copilot stdout/stderr and
+failure diagnostics. An absent standalone stream does not mean that session
+coverage is absent, nor does session coverage prove that every guest or launcher
+stream was collected.
+For each stdout/stderr artifact, `artifactSource` distinguishes a Docker
+`workload-file`, Cloud Hypervisor `backend-stream`, a recovered `agent-session`
+stream, or `unavailable`. The separate `agentSession` field indicates whether the
+session also covers that engine stream; `copilotDiagnostics` identifies session
+failure-diagnostic coverage or explicitly unavailable evidence. Session-derived
+streams are credential-redacted before their retained size is bounded.
+Only missing, unavailable or empty safe standalone streams can recover a bounded
+session-derived artifact. Unsafe or oversized sources remain classified and
+empty; a retained bounded session excerpt can still report engine coverage
+without silently overriding that source failure.
+
+Artifacts persist outside the work directory:
+
+| Runtime / host custody | Invocation path |
+|---|---|
+| Unprivileged Docker with narrow storage helper | `/var/lib/awf/enclave-storage/<host-uid>/host-state/debug-artifacts/docker/<run-id>/<invocation-id>/` |
+| Privileged Docker host adapter | `/var/lib/awf-cloud-hypervisor/debug-artifacts/docker/<run-id>/<invocation-id>/` |
+| Cloud Hypervisor | `/var/lib/awf-cloud-hypervisor/debug-artifacts/cloud-hypervisor/<run-id>/<invocation-id>/` |
+
+Older Cloud Hypervisor hashed VM-run directories can remain below the same
+protected root and remain mount-isolated. New captures use the canonical two-ID
+layout, while retaining the existing `enclave-session.log` filename; do not infer
+a legacy artifact's run identity from a new-layout path.
+
+Docker's helper installation is version-matched through `install.sh`; run AWF
+as the ordinary host user with noninteractive authorization for that narrow
+helper, **not** by running the whole workflow under sudo. The helper controls
+only fixed-root invocation storage and file ownership, never arbitrary debug
+destinations or arbitrary host commands. Docker public retention adds bounded
+stdout/stderr files to the same verified aggregate invocation allocation; it
+does not change resource budgets or impose a new process-wide file-size limit
+on seed copying or query writes. Standard-library pipe drains continuously
+consume stdout/stderr while retaining at most 1 MiB per stream, with bounded
+collector shutdown rather than waiting forever for descendant writers.
+Fixed capture-bound/capture-I/O evidence distinguishes truncation or unavailable
+capture from a complete stream; oversized streams remain explicitly classified
+and empty in the common artifact. The retention reader also rejects source files
+above 1 MiB instead of exporting an unbounded file.
+An unprivileged AWF process does not mean a rootless Docker daemon: this adapter
+still requires a supported local rootful daemon with shared host mount visibility.
+
+AWF checks the protected roots against primary-agent mounts and actual virtio-fs exports,
 on every startup regardless of the current debug flag or runtime, and never
-mounts it in the primary agent, broker, or enclave. The protected directory
-chain and artifacts are root-owned; directories are `0700`, regular single-link
+mounts it in the primary agent, broker, or enclave. Parent, child and symlink-alias
+mount exposures are rejected even when capture is disabled. The Cloud Hypervisor protected root
+and the fixed Docker helper storage root `/var/lib/awf/enclave-storage` remain
+excluded independently of the active runtime or flag. Cloud Hypervisor
+and privileged Docker artifacts are root-owned; unprivileged Docker artifacts
+are owned by the host AWF UID under the helper-created owner-only `host-state`.
+Protected artifact directories are `0700`, regular single-link
 files are `0600`, and symlink destinations are rejected. They are **not** copied into ordinary
 audit/log collections or widened for upload. Inspect them on the host and remove
 the specific invocation directory when no longer needed.
 
-The public-fixture smoke collector explicitly allowlists `enclave-session.log`
+The shared public diagnostics exporter explicitly allowlists `enclave-session.log`
 and the dedicated enclave proxy's projected `enclave-proxy-events.jsonl` and
 `enclave-proxy-container.log` in its bounded, short-lived debug artifact.
 Only closed-vocabulary event, level, source, and numeric status fields from
@@ -254,10 +339,178 @@ headers, or credentials. Public repository visibility is not a guarantee that
 every log line is safe to publish; host-only retention is not automatic upload
 authorization.
 
-Capture retains the trailing **1 MiB per raw stream/file**, not an unlimited
+#### Shared public diagnostics exporter
+
+`scripts/ci/collect-enclave-smoke-debug.cjs` is the supported standalone exporter
+for both `docker` and `cloud-hypervisor`. The historical filename remains stable;
+consumers do not need to copy its implementation or duplicate the diagnostic
+schema. Pin the exporter checkout to a reviewed AWF release or full commit SHA
+containing this interface. Pin the AWF execution installation separately.
+
+The daily agent regression also retains `startup.json` in the protected export
+directory before cleanup. This closed, bounded projection records the launch
+stage, exit/signal classification, and startup-record availability even when no
+invocation journal exists. It excludes raw AWF logs, prompts and capabilities.
+If subsequent invocation collection fails, `startup.json` remains separate from
+`collection-status.txt`; successful collection alone does not establish startup
+or inference success.
+
+```text
+node collector.cjs prepare BACKEND RUN_ID-RUN_ATTEMPT RUNNER_UID RUNNER_GID
+node collector.cjs collect BACKEND RUN_ID-RUN_ATTEMPT RUNNER_UID RUNNER_GID
+```
+
+Both operations run on the **host**, as root, using the same backend, key and
+numeric runner identity. Use `id -u` / `id -g` before sudo, not the guest's UID.
+The historical `prepare KEY` / `collect KEY UID GID` forms remain
+Cloud Hypervisor-only compatibility interfaces; new callers should select the
+backend explicitly and bind the runner identity during preparation.
+Only these preparation/collection operations and installation of the trusted
+exporter require host privilege; do not sudo the whole Docker workflow.
+The exporter has no CLI option for arbitrary protected source roots. Docker
+discovery covers the helper-owned and privileged layouts in the table above;
+Cloud Hypervisor discovery uses its host-executor journal and protected debug
+root, including run-cumulative proxy projections.
+
+**Scope and lifecycle.** Prepare once before AWF starts, then collect once after
+AWF has finished teardown, including after nonzero exit. Preparation takes a
+protected inventory baseline; pre-existing artifacts are excluded. One prepared
+scope supports **one new AWF run and at most one enclave invocation**. Multiple
+runs, invocations or entries sharing an invocation identity are rejected, not
+merged or silently selected. Do not run concurrent AWF jobs under the same host
+identity/storage scope. Use a fresh run/attempt key for a retry; preparing an
+existing key is an error. This interface does not resume an old collection or
+collect a run that started before preparation.
+
+**Validation and output.** The exporter uses the shared version-1
+`diagnostics.json` envelope and session projection described above, not a new
+execution schema. Identity, runtime, stopped/not-launched proof, closed
+operation/session evidence and stream availability must agree with retained
+artifacts. Retained public artifacts are produced only after AWF's verified
+public-debug eligibility gate; private, dynamic and unverified scopes cannot
+enable export through CLI arguments. Source directories and files remain
+protected: no symlinks, single-link regular files, owner-only permissions,
+bounded inventories, at most 32 invocation files and at most 1 MiB per stream.
+Publication allows those 32 files, four fixed run-level proxy projections, an
+optional 4 KiB startup projection and one status file: at most 38 files and
+36 MiB plus 8 KiB in total.
+Credential-pattern redaction is also applied during export; it is not a
+replacement for AWF's capture-time credential redaction.
+
+Cloud Hypervisor retains its allowlisted launcher, guest, VM, network,
+confinement and virtio-fs supplemental files, plus closed proxy accounting and
+response/debug projections. Docker does not require or synthesize these files.
+Legacy Cloud Hypervisor supplemental-only captures are not evidence of a
+complete shared envelope. Missing capture remains missing; an empty placeholder
+does not become a successful capture.
+
+All sources must validate before publication. The host stages output below
+`/var/lib/awf-enclave-smoke-export/<key>/`, outside agent/guest mounts. Only
+`upload/` and its `0600` files are handed to the specified runner UID/GID; source
+permissions, the baseline and the exporter are never widened. Upload only
+`upload/`, never the protected retention roots, baseline, recovery journal,
+raw API-proxy telemetry or guest output directory.
+
+`collection-status.txt` reports collection and absent evidence independently of
+the envelope's execution outcome. A nonzero workload exit is still collectable;
+`failure`, `exitCode`, `primaryFailure` and `cleanupFailure` retain their meaning.
+A retention failure may leave no envelope, so absent evidence alone cannot
+diagnose execution or retention failure. Collection rejection exits nonzero and
+reports a safe `failedCheck` identifier and bounded `category`, never a source
+path or arbitrary exception message. Where the prepared scope is safe, only this
+failure status is published; partially validated evidence is not uploaded.
+Keep the AWF step's original outcome: do not replace it with the collector's
+exit code or infer workload success from successful collection.
+
+Examples of failed checks are `retention-eligibility`, `diagnostics-identity`,
+`stop-proof`, `file-links`, `file-permissions`, `file-size`, `run-budget` and
+`invocation-budget`. Categories distinguish `ineligible`, `not-stopped`,
+`absent-evidence`, `unsafe-file`, `unsafe-directory`, `unsafe-permissions`,
+`oversized`, `concurrent-runs`, `multiple-invocations`, `scope-already-collected`,
+`invalid-evidence` and `read-failed`. These identify a failed collection check,
+not an inferred workload root cause.
+
+**Version-pinned Docker consumer example.** This example pins the exporter to the
+implementation commit below; review it independently before adoption and keep
+future upgrades pinned to a reviewed release or full commit SHA.
+The exporter is installed before the agent can modify the checkout. AWF must
+already be installed at a reviewed version supporting public Docker retention,
+with an eligible public-only config and host mount visibility.
+
+```yaml
+steps:
+  - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    with:
+      repository: github/gh-aw-firewall
+      ref: '22c1f117cb73ad5101746aa2c22b17da9e5f39a6'
+      path: trusted-awf-exporter
+      persist-credentials: false
+  - name: Prepare public Docker diagnostics
+    env:
+      DEBUG_RUN_KEY: ${{ github.run_id }}-${{ github.run_attempt }}
+    run: |
+      sudo install -d -m 0711 -o root -g root /var/lib/awf-enclave-smoke-export
+      sudo install -m 0600 -o root -g root \
+        "$GITHUB_WORKSPACE/trusted-awf-exporter/scripts/ci/collect-enclave-smoke-debug.cjs" \
+        /var/lib/awf-enclave-smoke-export/collector.cjs
+      sudo node /var/lib/awf-enclave-smoke-export/collector.cjs \
+        prepare docker "$DEBUG_RUN_KEY" "$(id -u)" "$(id -g)"
+  - name: Execute AWF
+    id: execute
+    run: awf --config "$GITHUB_WORKSPACE/awf-config.json" -- copilot
+  - name: Collect public Docker diagnostics
+    if: always()
+    continue-on-error: true
+    env:
+      DEBUG_RUN_KEY: ${{ github.run_id }}-${{ github.run_attempt }}
+    run: |
+      sudo node /var/lib/awf-enclave-smoke-export/collector.cjs \
+        collect docker "$DEBUG_RUN_KEY" "$(id -u)" "$(id -g)"
+  - name: Upload validated diagnostics or safe collection status
+    if: always()
+    uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+    with:
+      name: public-enclave-debug-${{ github.run_id }}-${{ github.run_attempt }}
+      path: /var/lib/awf-enclave-smoke-export/${{ github.run_id }}-${{ github.run_attempt }}/upload/
+      if-no-files-found: warn
+      retention-days: 1
+```
+
+The execution step deliberately has no `continue-on-error`; collection/upload
+run after failure without changing its outcome. If preparation itself is unsafe,
+there may be no upload directory. Use short retention and explicit publication
+authorization even for public repositories.
+
+#### Controlled inspection and sharing
+
+1. Locate the exact run/invocation path above using opaque host executor IDs.
+   Inspect `diagnostics.json` first as its owning host user (root only for
+   root-owned artifacts); do not infer an exit code from a host setup exception.
+2. Review only that invocation's four allowlisted files locally. Verify the
+   expected owner, directory `0700`, regular single-link files `0600`, and at
+   most 1 MiB per file. Reject aliases, unexpected files and mismatched IDs.
+   Redaction is defense in depth: public repository visibility does not make
+   prompts, outputs, provider details or unrelated host content safe to publish.
+3. If incident-specific disclosure is authorized, stage **only reviewed,
+   approved copies of those named files** in a dedicated upload directory.
+   Never change protected-source permissions or upload a parent directory,
+   recovery journals, seeds, capabilities, environment dumps, raw proxy logs,
+   Docker inspect output, or an entire AWF work directory. Omit any unapproved
+   file; no broad artifact glob or recursive archive is allowed.
+4. Use the existing incident artifact mechanism with explicit file paths,
+   an aggregate ceiling of 4 MiB for the common envelope and one-day retention.
+   Do not paste stream contents into ordinary logs, PR comments or summaries.
+   Remove staging copies after upload and the exact protected invocation
+   directory once the incident's local retention requirement is satisfied.
+   The Cloud Hypervisor smoke collector's separately bounded, explicitly
+   allowlisted proxy/VM evidence is not blanket authorization for Docker logs.
+
+Cloud Hypervisor additionally retains the trailing **1 MiB per raw stream/file**, not an unlimited
 transcript: guest stdout/stderr, launcher stdout/stderr, serial/VMM logs, and
 available virtiofs logs. Existing VM, network and confinement metadata accompany
-the logs. Collection runs before run-directory and network cleanup, including
+the logs. If a tail begins mid-line, its leading boundary fragment is discarded
+before redaction, rather than publishing a credential fragment whose prefix was
+outside the retained window. Collection runs before run-directory and network cleanup, including
 partial startup failure; an early termination/cleanup failure also attempts
 collection before propagating the failure. Missing/not-yet-created streams can
 be empty or absent. Once collected, cleanup retries do not overwrite the
@@ -705,6 +958,24 @@ avoids a GitHub API lookup. `gh` may still need network access to initialize or
 refresh Sigstore trust-root material unless that material is already cached or
 provisioned on the runner. Missing, mutable, incorrectly owned, renamed, or
 digest-mismatched artifacts fail closed.
+
+During artifact construction, engine `--version` probes run through
+`guest/cloud-hypervisor/verify-guest-engine.py`, not a bare privileged chroot.
+Each probe has private PID, mount, network, IPC, and UTS namespaces, private mount
+propagation, and a fresh read-only `nosuid,nodev,noexec` procfs so native runtimes
+can resolve `/proc/self/exe` without exposing host processes. No host `/proc` or
+`/dev` is bound into the verifier. The rootfs is read-only and `nosuid,nodev`;
+temporary home (32 MiB), `/tmp` (64 MiB), minimal devices (64 KiB), and `/dev/shm`
+(16 MiB) use disposable, inode-bounded tmpfs mounts. The host Python launcher
+chroots before dropping to the guest's UID/GID 65534 with no supplementary groups,
+empty capability sets, and `no_new_privs`, then executes only a fixed engine's
+version command with a minimal environment and no inherited credentials or input.
+Core dumps are disabled; file size, open files, and process count are limited.
+A 30-second timeout escalates to SIGKILL after 5 seconds. Namespace init exit
+kills descendants, and the synchronous `unshare` owner finishes before packaging
+or cleanup; all mounts are namespace-local and disappear with the verifier.
+The packaged `/proc` remains empty and guest boot mounts are unchanged.
+These probes are not a full VM boot or a reproduction of a specific engine crash.
 
 The Cloud Hypervisor-only `cloud-hypervisor-guest-base` image uses pinned Ubuntu
 26.04/glibc, certificates, distribution Python (`/usr/bin/python3`), Node 26,
@@ -1404,6 +1675,155 @@ The live job runs only when explicitly enabled by workflow dispatch or the
 After each case, the suite checks for leaked `awfvm-*` namespaces,
 `vmh*`/`vmn*`/`vmt*` interfaces, cgroups, and Cloud Hypervisor processes.
 
+### Provider-free selected-harness acceptance
+
+The same explicitly gated KVM job separately runs
+`scripts/ci/cloud-hypervisor-harness-observation.cjs` against its same-run pinned
+guest artifacts. It starts the compiled CLI, real host infrastructure and primary
+guest for each case. Test-owned Copilot, Claude and Codex executables live only in
+that case's workspace; neither a host-installed harness nor provider inference is
+used. The test preload observes (without replacing) the manager execution channel
+and temporarily supplies test-owned requirements to the ready-runtime validator.
+It does not change bundled catalogue constraints, feed admission or production
+configuration.
+
+The cases check canonical sanitized reports and publication before command entry,
+matching UID/GID, environment, PATH, cwd and `/bin/sh -lc` request semantics,
+absolute and relative guest executable selection, matching-floor admission,
+incompatible/unverified rejection before command entry, and explicitly
+**unconstrained**, not verified-compatible, legacy admission. Missing, malformed,
+failed, oversized, exactly-4096-byte, 4097-byte, timed-out and cancelled guest
+probes exercise the existing 10-second/4096-byte producer bounds. Normal and
+blocked runs require residue-free cleanup; cancellation rendezvous requires the
+fixture's actual guest probe marker before sending SIGTERM. The earlier smoke
+step retains its independent partial-start rollback coverage.
+
+A separate test process inside the running API sidecar reads its real report
+mount. It exercises the real eligibility store, request pin and routing controller
+with test-owned requirements, deterministic catalogue/planner/classifier responses
+and no provider calls. Changed run/harness bindings cannot qualify a new consumer;
+existing request/routing pins retain their original decisions. This is consumer
+fixture coverage with a guest-produced report, not live inference or a full
+production routing conversation.
+
+Only sanitized JSON is uploaded as `cloud-hypervisor-harness-observation-live`: exact checkout
+SHA, runner image/kernel, Node/Docker versions, infrastructure image IDs, guest
+artifact digests/source metadata, per-case probe/command evidence and cleanup
+outcomes. Probe metadata, stderr and the credential sentinel must not occur in
+command output or audit/proxy logs. Failures retain bounded phase information,
+not raw exceptions or logs. Portable fixture/parser/consumer and mocked-manager
+results are uploaded separately as `cloud-hypervisor-harness-deterministic`.
+Portable preload lifecycle regressions also run the compiled observation,
+applicable-floor validator and report publication through real proxy consumers.
+They simulate the guest probe, Docker transport and root-owned file metadata:
+expected incompatible/unverified failures must retain consumer and blocked-case
+evidence before rethrowing the original error; unexpected failures still fail.
+These regressions do not establish guest or mounted-sidecar acceptance.
+
+**Acceptance remains open in [#11091](https://github.com/github/gh-aw-firewall/issues/11091)
+until an eligible KVM run of this new step passes and its exact revision/evidence
+is reviewed.** Portable tests, an unrelated earlier Cloud Hypervisor smoke run,
+an artifact build or a skipped live job do not establish this path. macOS/arm64
+without `/dev/kvm` cannot produce guest evidence; the driver refuses unsupported
+hosts rather than substituting a host version or relaxing preflight. The workflow
+retains its reviewed label/dispatch and artifact/host gates; adding these tests
+does not authorize an agent to dispatch a live run. Enclaves, NVX, Docker/ARC-DinD
+live acceptance and sbx are outside this test slice.
+
+The `cloud-hypervisor-kvm` label is **not** an inference opt-in: at this revision
+its only workflow reference is the primary integration job above. That job also
+runs the broader provider-free shell/network/security smoke with a fake OpenAI
+credential sentinel; it is not restricted to the new harness fixtures alone.
+The build requires the existing GitHub Actions OIDC/provenance and artifact
+permissions, so "provider-free" does not mean "no CI credentials or network".
+The credential-bearing enclave live job is dispatch-only. Agentic Copilot,
+Claude, Codex, build and Playwright workflows use separate exact event labels
+(`ready-for-aw` or `test-cloud-hypervisor-*`), not this label. Isolation tests
+check the complete activation-gate shapes, not just label-name absence.
+No current `workflow_run` completion watcher includes either primary integration
+or enclave conformance workflow; the isolation regression also rejects a new
+broad completion wildcard that would require downstream inference review.
+
+Before any authorized run, pin and recheck the reviewed head, its current labels
+and workflow gates. Other opt-ins already present on a PR can independently
+activate their own jobs on a label event or subsequent synchronize event;
+`cloud-hypervisor-kvm` grants no authorization for those jobs. Keep unrelated
+inference labels absent. Required execution prerequisites remain a same-commit
+artifact build with the existing signer/digest validation, an eligible
+GitHub-hosted Ubuntu x86_64 runner with accessible KVM and cgroup v2, Docker and
+the production host preflight. Neither label application nor dispatch is
+performed by the portable tests.
+### Selected-harness fixture acceptance
+
+The same opt-in live-KVM job also runs
+`scripts/ci/cloud-hypervisor-harness-live.cjs` against the compiled primary
+backend and real guest manager. Copilot, Claude and Codex are deterministic
+fixture executables, not provider inference. The guest probe must precede command
+entry and use the command's UID/GID, environment, login-shell startup and
+`/workspace` cwd. Guest boot identity distinguishes this evidence from host
+execution. The fixture tests sanitized versions, unavailable probes, the
+10-second/4096-byte limits, admission blocking, cancellation and scoped cleanup.
+
+Test-owned requirements exercise matching, incompatible and unverified admission;
+they never modify the bundled catalogue. Unconstrained legacy admission is not
+verified compatibility. Feed harness constraints remain rejected as
+`catalogue_harness_unsupported`. Primary observations cannot qualify an enclave.
+The real sidecar report reader and immutable request/routing consumers are tested
+without changing an in-flight decision when the report is replaced.
+
+From a clean checkout on a supported GitHub-hosted Ubuntu x86_64/KVM runner,
+after building the CLI and the production Squid/API-proxy images as in the
+workflow, run:
+
+```bash
+sudo env "PATH=$PATH" \
+  "GITHUB_ACTIONS=$GITHUB_ACTIONS" \
+  "RUNNER_ENVIRONMENT=$RUNNER_ENVIRONMENT" "ImageOS=$ImageOS" \
+  "AWF_LIVE_COMMIT=$(git rev-parse HEAD)" \
+  "AWF_LIVE_ARTIFACTS=$PWD/artifacts/cloud-hypervisor-harness-live" \
+  timeout --signal=TERM --kill-after=30s 1100s \
+  node scripts/ci/cloud-hypervisor-harness-live.cjs /absolute/path/to/guest-artifacts
+```
+
+The API-proxy consumer image must carry
+`org.opencontainers.image.revision=$(git rev-parse HEAD)`. Guest artifact
+checksums and production host/artifact preflight remain required; the primary
+development-artifact bypass is explicit and is not release attestation.
+
+Keep the `cloud-hypervisor-harness-live` JSON artifact (exact tested revision,
+environment, artifact digests, observations and case outcomes) separate from
+`cloud-hypervisor-harness-deterministic` Jest results. Missing KVM, artifacts,
+runner capabilities, a skipped job or absent evidence is a **blocker**, never a
+pass. A green build-only workflow is not live selected-harness acceptance.
+Issue [#11091](https://github.com/github/gh-aw-firewall/issues/11091) must remain
+open until the exact reviewed revision has passing live evidence. This does not
+establish NVX, Docker/ARC-DinD or enclave acceptance, or close the broader phases.
+
+#### Implementation validation status (not live acceptance)
+
+The implementation session on GitHub-hosted Ubuntu 24 x86_64, Linux
+`7.0.0-1017-azure`, Node `22.23.4` had KVM access and passed unchanged production
+host/artifact preflight. Primary artifact inputs came from workflow run
+`41734616574`, manifest source `99b9bd90575ee6194a66cf793b3e9b25f7a284d8`
+(not the workflow head `2ac37e5006440059617f1d1976d6e1d0976078f0`); the downloaded
+archive matched GitHub's SHA-256
+`a20bdec0193b251eb7e719d5441008d8e93a7354c96983148dbc494037b0ff4b`,
+and its primary checksum set verified.
+
+**Live acceptance is blocked:** building the checkout's API-proxy image failed
+in the existing `install-system-trust.sh` because the sandbox's mounted
+`/etc/ssl/certs/ca-certificates.crt` could not be deleted (`Resource busy`).
+The clean-revision attempt at
+`450b755facef7b6826928249be797a7a62769156` exited 1 with `status: blocked`,
+`code: consumer-image-missing`, `passed: false` and an empty case list. Its
+separate `environment.json` records that revision, environment and artifact
+hashes. No guest observation-to-command case has passed in this session.
+
+Targeted deterministic tests, consumer tests and bundle checks passed; these
+do not replace the missing guest evidence. Use the
+opt-in KVM job above on an ordinary supported runner without bypassing trust
+checks or relabelling an unrelated image.
+
 ### Enclave conformance evidence and remaining live gate
 
 `.github/workflows/test-cloud-hypervisor-enclaves.yml` separates deterministic
@@ -1762,6 +2182,12 @@ primary-with-enclave configurations, untrusted pull-request events, mixed
 workload backends, unattested artifacts or model-budget changes. Exact checkout
 and manifest-source checks remain mandatory; release mode also retains its
 reviewed-commit ancestry check.
+
+The separately compiled daily regression profile admits only its exact main
+source SHA and scheduled or manual main-branch workflow identity, with one
+public-only, single-use Copilot, Claude or Codex agent enclave. Its primary and
+enclave both use Cloud Hypervisor. Production builds do not enable this profile;
+artifact attestation, isolation, backend matching and cleanup guards still apply.
 
 The agent-only and combined conformance profiles intentionally omit the optional
 `agent.maxModelRequests` and `agent.maxModelTokens` execution-cost limits. The

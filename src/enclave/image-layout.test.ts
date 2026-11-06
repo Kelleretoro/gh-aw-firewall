@@ -8,6 +8,24 @@ const containersRoot = path.join(repoRoot, 'containers');
 const dockerfilePath = path.join(containersRoot, 'enclave', 'Dockerfile');
 
 describe('enclave image contract', () => {
+  it('pins and seals all coding engines with their native optional dependencies', () => {
+    const dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
+    expect(dockerfile).toContain('ARG CODEX_VERSION=0.159.3');
+    expect(dockerfile).toContain('ARG CLAUDE_VERSION=2.1.280');
+    expect(dockerfile).toContain('npm_config_ignore_scripts=false npm install --global --include=optional --install-strategy=nested');
+    expect(dockerfile).toContain('"@openai/codex@${CODEX_VERSION}"');
+    expect(dockerfile).toContain('"@anthropic-ai/claude-code@${CLAUDE_VERSION}"');
+    for (const scope of ['@openai', '@anthropic-ai']) {
+      expect(dockerfile).toContain(
+        `COPY --from=enclave-agent-build /usr/local/lib/node_modules/${scope}/ /usr/local/lib/node_modules/${scope}/`,
+      );
+    }
+    expect(dockerfile).toContain('libgcc-s1 libstdc++6');
+    expect(dockerfile).toContain('chmod -R a+rX,a-w /usr/local/lib/node_modules/@openai /usr/local/lib/node_modules/@anthropic-ai');
+    expect(dockerfile).toContain('codex --version && claude --version');
+    expect(dockerfile).toContain('LABEL io.github.awf.enclave.role="script"');
+  });
+
   it('builds all three enclave images from one neutral Dockerfile', () => {
     const dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
     for (const target of ['AS enclave-script', 'AS enclave-agent', 'AS enclave-mcp-server']) {
@@ -59,7 +77,7 @@ describe('enclave image contract', () => {
   it('launches Copilot through the copied Node interpreter without env', () => {
     const dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
     const patch = dockerfile.match(
-      /RUN sed -i '([^']+)' \/usr\/local\/lib\/node_modules\/@github\/copilot\/npm-loader\.js/,
+      /sed -i '([^']+)' \/usr\/local\/lib\/node_modules\/@github\/copilot\/npm-loader\.js/,
     );
     expect(patch?.[1]).toBe('1c#!/usr/local/bin/node');
     expect(dockerfile).toContain(
@@ -101,5 +119,23 @@ describe('enclave image contract', () => {
     for (const image of ['enclave-script', 'enclave-agent', 'enclave-mcp-server']) {
       expect(release).toContain(image);
     }
+  });
+
+  it('seals a build-extracted Copilot distribution outside invocation storage', () => {
+    const dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
+    expect(dockerfile).toContain('COPILOT_CACHE_HOME=/usr/local/lib/node_modules/@github/copilot/cache');
+    expect(dockerfile).toContain('copilot --no-auto-update --version');
+    expect(dockerfile).toContain('cache/pkg/$(node -p \'process.platform + "-" + process.arch\')/${COPILOT_CLI_VERSION}');
+    expect(dockerfile).toContain('test -r /usr/local/lib/node_modules/@github/copilot/runtime/index.js');
+    expect(dockerfile.indexOf('find /usr/local/lib/node_modules/@github/copilot')).toBeGreaterThan(
+      dockerfile.indexOf('copilot --no-auto-update --version'),
+    );
+    expect(dockerfile.indexOf('copilot --no-auto-update --version')).toBeGreaterThanOrEqual(0);
+    for (const image of ['enclave', 'cloud-hypervisor']) {
+      const source = fs.readFileSync(path.join(containersRoot, image, 'Dockerfile'), 'utf8');
+      expect(source).toContain('ENV COPILOT_CLI_DIST_DIR=/usr/local/lib/node_modules/@github/copilot/runtime');
+    }
+    expect(dockerfile).toContain('chown -R 0:0 /usr/local/lib/node_modules/@github/copilot');
+    expect(dockerfile).toContain('chmod -R a+rX,a-w /usr/local/lib/node_modules/@github/copilot');
   });
 });

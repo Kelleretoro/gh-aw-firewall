@@ -162,6 +162,7 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
         : undefined,
     envFile: options.envFile as string | undefined,
     volumeMounts,
+    inputDirs: options.inputDir as string[] | undefined,
     filesystemAllowWrite: options.filesystemAllowWrite as string[] | undefined,
     containerWorkDir: options.containerWorkdir as string | undefined,
     dnsServers,
@@ -193,6 +194,7 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
     allowedUrls,
     enableApiProxy: options.enableApiProxy as boolean | undefined,
     apiProxyCaCert: options.apiProxyCaCert as string | undefined,
+    copilotTokenBroker: options.copilotTokenBroker as boolean | undefined,
     modelFallback:
       options.modelFallback as { enabled?: boolean; strategy?: 'middle_power' } | undefined,
     fallbackModels: options.fallbackModels as string[] | undefined,
@@ -260,6 +262,7 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
     chrootIdentity,
     dind,
     cloudHypervisor,
+    enclaveDebugPublic: options.enclaveDebugPublic as boolean | undefined,
     nvx,
     enclaves: normalizeEnclavesConfig(
       options.enclaves as AwfFileConfig['enclaves'] | undefined,

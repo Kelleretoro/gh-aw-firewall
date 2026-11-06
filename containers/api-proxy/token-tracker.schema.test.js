@@ -449,7 +449,9 @@ describe('token-usage JSONL record schema field', () => {
     proxyRes.emit('end');
 
     setTimeout(() => {
-      const usageRecords = mockStream.writtenRecords.filter(r => r._schema);
+      const usageRecords = mockStream.writtenRecords.filter(
+        r => r.event === 'token_usage' && r.request_id === 'schema-field-http',
+      );
       expect(usageRecords).toHaveLength(1);
       const parsed = usageRecords[0];
       expect(parsed._schema).toMatch(/^token-usage\/v\d+\.\d+\.\d+(-\w+)?$/);
@@ -473,7 +475,9 @@ describe('token-usage JSONL record schema field', () => {
     socket.emit('close');
 
     setTimeout(() => {
-      const usageRecords = mockStream.writtenRecords.filter(r => r._schema);
+      const usageRecords = mockStream.writtenRecords.filter(
+        r => r.event === 'token_usage' && r.request_id === 'schema-field-ws',
+      );
       expect(usageRecords).toHaveLength(1);
       const parsed = usageRecords[0];
       expect(parsed._schema).toMatch(/^token-usage\/v\d+\.\d+\.\d+(-\w+)?$/);
@@ -550,6 +554,7 @@ describe('token-usage JSONL record schema field', () => {
         ai_credits_total: 0.05,
         ai_credits_pricing_catalog_id: 'github/gh-aw/model-pricing',
         ai_credits_pricing_catalog_version: 'sha256:test-http-catalog',
+        ai_credits_pricing_estimate: { basis: 'family', donorCount: 3 },
       }),
     });
 
@@ -560,7 +565,9 @@ describe('token-usage JSONL record schema field', () => {
     proxyRes.emit('end');
 
     setTimeout(() => {
-      const usageRecords = mockStream.writtenRecords.filter(r => r._schema);
+      const usageRecords = mockStream.writtenRecords.filter(
+        r => r.event === 'token_usage' && r.request_id === 'budget-fields-http',
+      );
       expect(usageRecords).toHaveLength(1);
       const parsed = usageRecords[0];
       expect(parsed).toMatchObject({
@@ -569,6 +576,7 @@ describe('token-usage JSONL record schema field', () => {
         ai_credits_total: 0.05,
         ai_credits_pricing_catalog_id: 'github/gh-aw/model-pricing',
         ai_credits_pricing_catalog_version: 'sha256:test-http-catalog',
+        ai_credits_pricing_estimate: { basis: 'family', donorCount: 3 },
       });
       expect(validateTokenUsageRecord(parsed)).toBe(true);
       done();
@@ -596,7 +604,9 @@ describe('token-usage JSONL record schema field', () => {
     proxyRes.emit('end');
 
     setTimeout(() => {
-      const usageRecords = mockStream.writtenRecords.filter(r => r._schema);
+      const usageRecords = mockStream.writtenRecords.filter(
+        r => r.event === 'token_usage' && r.request_id === 'budget-fields-http-none',
+      );
       expect(usageRecords).toHaveLength(1);
       const parsed = usageRecords[0];
       expect(parsed.ai_credits_this_response).toBeUndefined();
@@ -621,6 +631,7 @@ describe('token-usage JSONL record schema field', () => {
         ai_credits_total: 0.08,
         ai_credits_pricing_catalog_id: 'github/gh-aw/model-pricing',
         ai_credits_pricing_catalog_version: 'sha256:test-ws-catalog',
+        ai_credits_pricing_estimate: { basis: 'backend', donorCount: 4 },
       }),
     });
 
@@ -628,7 +639,9 @@ describe('token-usage JSONL record schema field', () => {
     socket.emit('close');
 
     setTimeout(() => {
-      const usageRecords = mockStream.writtenRecords.filter(r => r._schema);
+      const usageRecords = mockStream.writtenRecords.filter(
+        r => r.event === 'token_usage' && r.request_id === 'budget-fields-ws',
+      );
       expect(usageRecords).toHaveLength(1);
       const parsed = usageRecords[0];
       expect(parsed).toMatchObject({
@@ -637,6 +650,7 @@ describe('token-usage JSONL record schema field', () => {
         ai_credits_total: 0.08,
         ai_credits_pricing_catalog_id: 'github/gh-aw/model-pricing',
         ai_credits_pricing_catalog_version: 'sha256:test-ws-catalog',
+        ai_credits_pricing_estimate: { basis: 'backend', donorCount: 4 },
       });
       expect(validateTokenUsageRecord(parsed)).toBe(true);
       done();
@@ -659,7 +673,9 @@ describe('token-usage JSONL record schema field', () => {
     socket.emit('close');
 
     setTimeout(() => {
-      const usageRecords = mockStream.writtenRecords.filter(r => r._schema);
+      const usageRecords = mockStream.writtenRecords.filter(
+        r => r.event === 'token_usage' && r.request_id === 'budget-fields-ws-none',
+      );
       expect(usageRecords).toHaveLength(1);
       const parsed = usageRecords[0];
       expect(parsed.ai_credits_this_response).toBeUndefined();

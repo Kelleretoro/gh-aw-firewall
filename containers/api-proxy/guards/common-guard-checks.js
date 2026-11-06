@@ -14,9 +14,9 @@
  *   - buildLogFields — function(block) → extra log-fields object
  *
  * Model-specific guards (model_multiplier_cap, retired_model,
- * unknown_model_ai_credits) are only included when `model` is truthy (non-null
- * and non-empty string).  For WebSocket upgrade requests there is no JSON
- * request body, so callers should pass null and the model guards are skipped.
+ * model_policy_violation) are only included when `model` is truthy (non-null
+ * and non-empty string). WebSocket upgrades identify models from the query
+ * string; callers pass null when no model is identified.
  *
  * @param {object} deps - Guard state getter and error-builder functions.
  * @param {Function} deps.getMaxRunsBlockState
@@ -31,7 +31,7 @@
  * @param {Function} deps.buildModelMultiplierCapError
  * @param {Function} deps.getRetiredModelBlockState
  * @param {Function} deps.buildRetiredModelError
- * @param {Function} deps.checkUnknownModelRejection
+ * @param {Function} deps.checkModelPricing
  * @param {Function} deps.getModelPolicyBlockState
  * @param {Function} deps.buildModelPolicyError
  * @param {string|null} model - Model name extracted from the request, or null
@@ -53,10 +53,12 @@ function buildCommonGuardChecks(deps, model, provider = null) {
     buildModelMultiplierCapError,
     getRetiredModelBlockState,
     buildRetiredModelError,
-    checkUnknownModelRejection,
+    checkModelPricing,
     getModelPolicyBlockState,
     buildModelPolicyError,
   } = deps;
+
+  const pricingError = checkModelPricing(model, provider);
 
   return [
     {
@@ -109,6 +111,14 @@ function buildCommonGuardChecks(deps, model, provider = null) {
         hard_cap: block.hardCap === true,
       }),
     },
+    {
+      block: pricingError,
+      isBlocked: block => !!block,
+      statusCode: 500,
+      eventName: 'pricing_resolution_error',
+      buildError: block => block,
+      buildLogFields: () => ({ reason: 'accounting_unavailable' }),
+    },
     // Model-specific guards — only active when a model was identified in the request.
     ...(model ? [
       {
@@ -124,7 +134,7 @@ function buildCommonGuardChecks(deps, model, provider = null) {
         }),
       },
       {
-        block: getRetiredModelBlockState(model),
+        block: getRetiredModelBlockState(model, provider),
         isBlocked: block => !!block,
         statusCode: 400,
         eventName: 'retired_model',
@@ -143,16 +153,6 @@ function buildCommonGuardChecks(deps, model, provider = null) {
         buildLogFields: block => ({
           model: block.model,
           reason: block.reason,
-        }),
-      },
-      {
-        block: checkUnknownModelRejection(model, provider),
-        isBlocked: block => !!block,
-        statusCode: 400,
-        eventName: 'unknown_model_ai_credits',
-        buildError: block => block.error,
-        buildLogFields: block => ({
-          model: block.model,
         }),
       },
     ] : []),

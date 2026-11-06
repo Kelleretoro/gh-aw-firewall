@@ -1,6 +1,7 @@
 'use strict';
 
 const http = require('http');
+const { pinRequestEligibility } = require('./model-eligibility');
 const { composeBodyTransforms } = require('./proxy-utils');
 const { logRequest } = require('./logging');
 const { CALLER_HEADER, callerHeaderRejection, parseCallerHeader } = require('./caller-header');
@@ -23,7 +24,13 @@ function attachCaller(req, adapter) {
 
 function createHealthCheckHandler(adapter, modelBudgetEnabled = false) {
   return (_req, res) => {
-    if (adapter.isEnabled()) {
+    if (adapter.renewableAuth && !adapter.isReady?.()) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'unavailable', service: `awf-api-proxy-${adapter.name}`,
+        message: 'Copilot token broker authentication unavailable',
+      }));
+    } else if (adapter.isEnabled()) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'healthy',
@@ -56,16 +63,29 @@ function createProxyHandler(adapter, checkRateLimit, proxyRequest) {
       ? composeBodyTransforms(req.awfRouting.bodyTransform, adapter.getBodyTransform())
       : adapter.getBodyTransform();
 
-    proxyRequest(
+    const dispatch = (headers) => proxyRequest(
       req, res,
       adapter.getTargetHost(req),
-      adapter.getAuthHeaders(req),
+      headers,
       adapter.name,
       adapter.getBasePath(req),
       bodyTransform,
       adapter.getRequestSigner ? adapter.getRequestSigner() : null,
       adapter.getTargetScheme ? adapter.getTargetScheme(req) : 'https'
     );
+    if (adapter.renewableAuth) {
+      adapter.getAuthHeaders(req).then(headers => {
+        if (!req.destroyed && !res.destroyed) dispatch(headers);
+      }, () => {
+        if (res.destroyed || res.headersSent) return;
+        if (req.awfRouting) req.awfRouting.localError = { code: 'token_broker_unavailable', type: 'authentication_error' };
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { code: 'token_broker_unavailable', type: 'authentication_error',
+          message: 'Copilot token broker authentication unavailable' } }));
+      });
+    } else {
+      dispatch(adapter.getAuthHeaders(req));
+    }
   };
 }
 
@@ -125,9 +145,9 @@ function createWebSocketUpgradeHandler(adapter, proxyWebSocket, { modelBudgetEna
       return;
     }
 
-    // Bedrock SigV4 is implemented for buffered HTTP requests. Never allow an
-    // unsigned WebSocket upgrade to escape through an AWS-authenticated adapter.
-    if (adapter.getRequestSigner?.()) {
+    // Buffered SigV4 and renewable broker auth do not support WebSockets.
+    // Never forward an upgrade without a supported authentication path.
+    if (adapter.getRequestSigner?.() || adapter.renewableAuth) {
       auditEnclaveResponse(503, 'local');
       socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
       socket.destroy();
@@ -174,6 +194,7 @@ function createProviderServer(adapter, deps) {
   const handleUpgrade = createWebSocketUpgradeHandler(adapter, proxyWebSocket, { modelBudgetEnabled });
 
   const server = http.createServer(async (req, res) => {
+    pinRequestEligibility(req);
     if (adapter.isManagementPort && handleManagementEndpoint(req, res)) return;
 
     if (req.url === '/health' && req.method === 'GET') {
@@ -182,8 +203,20 @@ function createProviderServer(adapter, deps) {
     }
 
     if (req.url === '/reflect' && req.method === 'GET') {
+      let reflection;
+      try {
+        reflection = reflectEndpoints();
+      } catch (error) {
+        if (error.code !== 'pricing_resolution_error') throw error;
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: {
+          type: 'pricing_resolution_error',
+          message: 'AI-credit pricing resolution failed; accounting could not be completed.',
+        } }));
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(reflectEndpoints()));
+      res.end(JSON.stringify(reflection));
       return;
     }
 
@@ -219,6 +252,7 @@ function createProviderServer(adapter, deps) {
   });
 
   server.on('upgrade', async (req, socket, head) => {
+    pinRequestEligibility(req);
     if (catalogueReady) await catalogueReady;
     if (socket.destroyed) return;
     attachCaller(req, adapter);

@@ -18,6 +18,7 @@ export interface OtlpEndpoint {
  * HTTP and HTTPS traffic using domain whitelisting and optional blocklisting.
  */
 export interface SquidConfig {
+  apiProxyBrokerUpstreams?: Array<{ hostname: string; port: number }>;
   /**
    * List of allowed domains for proxy access
    * 
@@ -159,6 +160,9 @@ export interface SquidConfig {
    * do not block connections to the api-proxy before the allow rule fires.
    */
   apiProxyPorts?: number[];
+
+  /** Exact custom-port upstreams reachable only from the trusted API proxy. */
+  apiProxyUpstreams?: Array<{ hostname: string; port: number }>;
 
   /**
    * IP address of the credential-isolated CLI proxy sidecar.

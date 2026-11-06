@@ -4,6 +4,10 @@ const { enforceWebSocketGuards, enforceWebSocketRateLimit } = require('./websock
 const { createWebSocketTunnel, extractRequestModelFromUrl } = require('./websocket-tunnel');
 const { getCatalogueLoader } = require('./catalogue-loader');
 const { captureRuntimePricing } = require('./runtime-model-catalog');
+const { getModelUnavailability } = require('./model-recovery');
+const { isGithubCopilotCatalogTarget } = require('./providers/copilot-auth');
+const { pinRequestEligibility } = require('./model-eligibility');
+const { getRequestModel } = require('./model-fallback-chain');
 
 function createProxyWebSocket({
   limiter,
@@ -27,7 +31,7 @@ function createProxyWebSocket({
   buildModelMultiplierCapError,
   getRetiredModelBlockState,
   buildRetiredModelError,
-  checkUnknownModelRejection,
+  checkModelPricing,
   getModelPolicyBlockState,
   buildModelPolicyError,
   trackWebSocketTokenUsage,
@@ -45,7 +49,7 @@ function createProxyWebSocket({
     buildModelMultiplierCapError,
     getRetiredModelBlockState,
     buildRetiredModelError,
-    checkUnknownModelRejection,
+    checkModelPricing,
     getModelPolicyBlockState,
     buildModelPolicyError,
   };
@@ -74,6 +78,8 @@ function createProxyWebSocket({
    *   port 80 instead of 443.
    */
   return function proxyWebSocket(req, socket, head, targetHost, injectHeaders, provider, basePath = '', lifecycleHooks = {}) {
+    pinRequestEligibility(req);
+    req.awfModelCatalogAuthoritative = provider === 'copilot' && isGithubCopilotCatalogTarget(targetHost);
     req.awfCatalogue = getCatalogueLoader().capture();
     req.awfRuntimePricing = captureRuntimePricing();
     const startTime = Date.now();
@@ -103,12 +109,32 @@ function createProxyWebSocket({
     }
 
     const requestModel = extractRequestModelFromUrl(req.url);
+    const eligibilityModel = getRequestModel(null, req.url) ||
+      (requestModel ? { model: requestModel, location: 'query' } : null);
     const upstreamPath = buildUpstreamPath(req.url, targetHost, basePath);
 
     if (enforceWebSocketGuards({
-      socket, logRequest, requestId, provider, requestModel,
+      socket, logRequest, requestId, provider, requestModel, eligibilityModel, req,
       pricingOptions: { catalogue: req.awfCatalogue, runtimeCatalog: req.awfRuntimePricing },
     }, guardDeps)) {
+      return;
+    }
+
+    // Future opaque frames can carry tools/features (and another model). Do
+    // not rewrite only the handshake and claim compatibility for the session.
+    const unavailable = getModelUnavailability(requestModel, provider, req);
+    if (unavailable) {
+      logRequest('warn', 'model_recovery_requires_http', {
+        request_id: requestId, provider,
+        requested_model: sanitizeForLog(requestModel), reason: unavailable.reason,
+      });
+      const body = JSON.stringify({ error: {
+        code: 'model_recovery_requires_http',
+        type: 'invalid_request_error',
+        message: 'Model is unavailable. Use HTTP inference for compatible model recovery, or select an available model before opening the WebSocket.',
+      } });
+      socket.write(`HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+      socket.destroy();
       return;
     }
 

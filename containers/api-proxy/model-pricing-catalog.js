@@ -1,13 +1,15 @@
 'use strict';
 
 const { getProviderAliases } = require('./provider-pricing-overlays');
+const { selectPricingFact } = require('./catalogue-contract/pricing-resolution');
+const exact = require('./catalogue-contract/exact-pricing');
 
 let cachedRaw;
 let cachedCatalog = null;
 
-function canonicalizeModel(model) {
+function canonicalizeModel(model, preserveNamespace = false) {
   if (!model || typeof model !== 'string') return '';
-  const bare = model.includes('/') ? model.slice(model.indexOf('/') + 1) : model;
+  const bare = !preserveNamespace && model.includes('/') ? model.slice(model.indexOf('/') + 1) : model;
   const withoutDateSuffix = bare.replace(/(-alpha)?-(\d{4}-\d{2}-\d{2}|\d{8})$/, '');
   return withoutDateSuffix.replace(/[._]/g, '-').toLowerCase();
 }
@@ -17,17 +19,14 @@ function normalizePricing(entry) {
   const normalizeTier = (tier, requireThreshold = false) => {
     if (!tier || typeof tier !== 'object' || Array.isArray(tier)) return null;
     const { input, output, cachedInput, cacheWrite, reasoning } = tier;
-    if (typeof input !== 'number' || !Number.isFinite(input) || input < 0 ||
-        typeof output !== 'number' || !Number.isFinite(output) || output < 0 ||
-        typeof cachedInput !== 'number' || !Number.isFinite(cachedInput) || cachedInput < 0 ||
-        (cacheWrite !== null && (typeof cacheWrite !== 'number' || !Number.isFinite(cacheWrite) || cacheWrite < 0)) ||
-        typeof reasoning !== 'number' || !Number.isFinite(reasoning) || reasoning < 0) {
+    if ([input, output, cachedInput, reasoning].some(value => value === undefined) ||
+        cacheWrite === undefined) {
       return null;
     }
     const threshold = tier.threshold;
     if (requireThreshold && (!Number.isFinite(threshold) || threshold <= 0)) return null;
     return {
-      pricing: { input, cachedInput, cacheWrite, output, reasoning },
+      pricing: exact.rates({ input, cachedInput, cacheWrite, output, reasoning }),
       ...(requireThreshold ? { threshold } : {}),
     };
   };
@@ -38,9 +37,10 @@ function normalizePricing(entry) {
 
   const longContext = normalizeTier(entry.longContext, true);
   if (!longContext) return null;
+  longContext.pricing.threshold = longContext.threshold;
   return {
     default: defaultTier.pricing,
-    longContext: { ...longContext.pricing, threshold: longContext.threshold },
+    longContext: longContext.pricing,
   };
 }
 
@@ -69,11 +69,11 @@ function getCatalog() {
   return cachedCatalog;
 }
 
-function resolveModelPricingCatalog(provider, model, inputTokens = 0) {
+function getConfiguredPricingFact(provider, model, options = {}) {
   const catalog = getCatalog();
   if (!catalog || !provider || !model) return null;
 
-  const canonical = canonicalizeModel(model);
+  const canonical = canonicalizeModel(model, options.preserveNamespace === true);
   if (!canonical) return null;
 
   for (const alias of getProviderAliases(provider)) {
@@ -81,23 +81,20 @@ function resolveModelPricingCatalog(provider, model, inputTokens = 0) {
     const models = providerEntry?.models;
     if (!models || typeof models !== 'object' || Array.isArray(models)) continue;
     for (const [catalogModel, entry] of Object.entries(models)) {
-      if (canonicalizeModel(catalogModel) !== canonical) continue;
+      if (canonicalizeModel(catalogModel, options.preserveNamespace === true) !== canonical) continue;
       const normalized = normalizePricing(entry);
       if (!normalized) return null;
-      const useLongContext = !!normalized.longContext &&
-        inputTokens > normalized.longContext.threshold;
       return {
-        pricing: useLongContext
-          ? normalized.longContext
-          : normalized.default,
-        source: 'shared_catalog',
-        tier: useLongContext ? 'long_context' : 'default',
-        pricingCatalogId: catalog.catalogId,
-        pricingCatalogVersion: catalog.version,
+        source: 'shared_catalog', ...normalized, threshold: normalized.longContext?.threshold,
+        metadata: { pricingCatalogId: catalog.catalogId, pricingCatalogVersion: catalog.version },
       };
     }
   }
   return null;
+}
+
+function resolveModelPricingCatalog(provider, model, inputTokens = 0) {
+  return selectPricingFact(getConfiguredPricingFact(provider, model), inputTokens);
 }
 
 function resetModelPricingCatalogForTests() {
@@ -106,6 +103,9 @@ function resetModelPricingCatalogForTests() {
 }
 
 module.exports = {
+  getConfiguredPricingModelIds: provider => [...new Set(getProviderAliases(provider)
+    .flatMap(alias => Object.keys(getCatalog()?.providers[alias]?.models || {})))],
+  getConfiguredPricingFact,
   resolveModelPricingCatalog,
   resetModelPricingCatalogForTests,
 };

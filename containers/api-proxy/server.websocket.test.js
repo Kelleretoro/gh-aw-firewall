@@ -9,6 +9,7 @@ const http = require('http');
 const tls = require('tls');
 const { EventEmitter } = require('events');
 const { setupServerTestEnv } = require('./test-helpers/server-mock-factories');
+const { collectLogOutput } = require('./test-helpers/log-test-helpers');
 
 let proxyWebSocket;
 
@@ -47,12 +48,25 @@ function makeUpgradeReq(overrides = {}) {
 
 describe('proxyWebSocket', () => {
   afterEach(() => {
+    require('./runtime-model-catalog').clearRuntimeModels();
     jest.restoreAllMocks();
   });
 
   // ── Request validation ─────────────────────────────────────────────────────
 
   describe('request validation', () => {
+    it('fails explicitly instead of rewriting a model in an opaque WebSocket session', () => {
+      require('./runtime-model-catalog').replaceRuntimeModels('copilot', [{
+        id: 'available', supportedEndpoints: ['/responses'],
+      }]);
+      const req = makeUpgradeReq({ url: '/v1/responses?model=unavailable' });
+      const socket = makeMockSocket();
+      proxyWebSocket(req, socket, Buffer.alloc(0), 'api.githubcopilot.com', {}, 'copilot');
+      expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('model_recovery_requires_http'));
+      expect(socket.destroy).toHaveBeenCalled();
+      expect(req.url).toBe('/v1/responses?model=unavailable');
+    });
+
     it('rejects a non-WebSocket upgrade (e.g. h2c) with 400', () => {
       const socket = makeMockSocket();
       proxyWebSocket(makeUpgradeReq({ headers: { 'upgrade': 'h2c' } }), socket, Buffer.alloc(0), 'api.openai.com', {}, 'openai');
@@ -245,6 +259,38 @@ describe('proxyWebSocket', () => {
           resolve();
         }));
       });
+    });
+
+    it('replaces Codex placeholder auth through the OpenAI adapter before the WSS upgrade', async () => {
+      jest.spyOn(http, 'request').mockReturnValue(connectReq);
+      jest.spyOn(tls, 'connect').mockReturnValue(tlsSocket);
+      const { createOpenAIAdapter } = require('./providers/openai');
+      const { createWebSocketUpgradeHandler } = require('./server-factory');
+      const adapter = createOpenAIAdapter({ OPENAI_API_KEY: 'test-only-sidecar-key' });
+      const placeholder = 'sk-placeholder-for-api-proxy';
+      const req = makeUpgradeReq();
+      req.headers.authorization = 'Bearer ' + placeholder;
+      req.headers['proxy-authorization'] = 'Bearer ' + placeholder;
+      req.headers['x-api-key'] = placeholder;
+
+      createWebSocketUpgradeHandler(adapter, wsProxy)(req, socket, Buffer.alloc(0));
+      connectReq.emit('connect', { statusCode: 200 }, tunnel);
+      tlsSocket.emit('secureConnect');
+      const upgrade = tlsSocket.write.mock.calls.find(
+        ([data]) => typeof data === 'string' && data.startsWith('GET ')
+      )[0];
+      expect(upgrade.startsWith('GET /v1/responses HTTP/1.1\r\n')).toBe(true);
+      expect(upgrade).not.toContain(placeholder);
+      expect(upgrade).toContain('Authorization: ' + adapter.getAuthHeaders().Authorization);
+      expect(upgrade.match(/^authorization:/gim)).toHaveLength(1);
+      expect(upgrade).not.toMatch(/^(proxy-authorization|x-api-key):/im);
+      expect(upgrade).toContain('host: api.openai.com\r\n');
+      expect(http.request).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'CONNECT', path: 'api.openai.com:443', host: '127.0.0.1', port: 3128,
+      }));
+      expect(tls.connect).toHaveBeenCalledWith(expect.objectContaining({
+        servername: 'api.openai.com', rejectUnauthorized: true,
+      }));
     });
 
     it('forwards the CONNECT request to the configured Squid proxy host/port', () => {
@@ -468,28 +514,37 @@ describe('proxyWebSocket security guards', () => {
     expect(socket.destroy).toHaveBeenCalled();
   });
 
-  it('blocks with 403 when ai-credits limit is exceeded', () => {
-    process.env.AWF_MAX_AI_CREDITS = '0.000001'; // tiny cap — any real usage will exceed it
-    applyAiCreditsUsage({ input_tokens: 1_000_000, output_tokens: 1_000_000 }, 'gpt-4o');
+  it.each(['/v1/responses', '/v1/responses?model=bogus'])(
+    'blocks with 403 when ai-credits limit is exceeded for %s', url => {
+      process.env.AWF_MAX_AI_CREDITS = '0.000001'; // tiny cap — any real usage will exceed it
+      applyAiCreditsUsage({ input_tokens: 1_000_000, output_tokens: 1_000_000 }, 'gpt-5-mini', 'openai');
 
-    const socket = makeMockSocket();
-    wsProxy(makeUpgradeReq(), socket, Buffer.alloc(0), 'api.openai.com', {}, 'openai');
+      const socket = makeMockSocket();
+      wsProxy(makeUpgradeReq({ url }), socket, Buffer.alloc(0), 'api.openai.com', {}, 'openai');
 
-    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('HTTP/1.1 403 Forbidden'));
-    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('"ai_credits_limit_exceeded"'));
-    expect(socket.destroy).toHaveBeenCalled();
-  });
+      expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('HTTP/1.1 403 Forbidden'));
+      expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('"ai_credits_limit_exceeded"'));
+      expect(socket.destroy).toHaveBeenCalled();
+    },
+  );
 
-  it('rejects an unknown WebSocket query model when AI-credit accounting is enabled', () => {
-    process.env.AWF_MAX_AI_CREDITS = '10';
+  it.each([undefined, '10'])(
+    'warns and allows an estimated WebSocket query model with maxAiCredits=%s', max => {
+      if (max === undefined) delete process.env.AWF_MAX_AI_CREDITS;
+      else process.env.AWF_MAX_AI_CREDITS = max;
 
-    const socket = makeMockSocket();
-    wsProxy(makeUpgradeReq({ url: '/v1/responses?model=bogus' }), socket, Buffer.alloc(0), 'api.openai.com', {}, 'copilot');
+      const { lines } = collectLogOutput();
+      const socket = makeMockSocket();
+      wsProxy(makeUpgradeReq({ url: '/v1/responses?model=bogus' }), socket, Buffer.alloc(0), 'api.openai.com', {}, 'copilot');
 
-    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('HTTP/1.1 400 Bad Request'));
-    expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('"unknown_model_ai_credits"'));
-    expect(socket.destroy).toHaveBeenCalled();
-  });
+      expect(socket.write).not.toHaveBeenCalledWith(expect.stringContaining('HTTP/1.1 400 Bad Request'));
+      expect(lines).toEqual(expect.arrayContaining([
+        expect.objectContaining({ level: 'warn', event: 'estimated_model_ai_credits_pricing', basis: 'backend' }),
+      ]));
+      // No upstream proxy is configured here; reaching this error proves the guards passed.
+      expect(socket.write).toHaveBeenCalledWith(expect.stringContaining('HTTP/1.1 502 Bad Gateway'));
+    },
+  );
 
   it('rejects an unverifiable Copilot auto WebSocket model multiplier', () => {
     process.env.AWF_MAX_MODEL_MULTIPLIER = '1';
